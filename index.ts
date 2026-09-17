@@ -182,6 +182,30 @@ export default function piDuo(pi: ExtensionAPI) {
   let tonyQueue: Promise<void> = Promise.resolve();
   let tonySentSequence = 0;
   let lastTonyDelivery: { sequence: number; content: string } | undefined;
+  let extensionActive = true;
+  let lifecycleGeneration = 0;
+
+  const isCurrentGeneration = (generation: number) =>
+    extensionActive && generation === lifecycleGeneration;
+
+  const sendMessageSafely = (
+    message: Parameters<ExtensionAPI["sendMessage"]>[0],
+    options?: Parameters<ExtensionAPI["sendMessage"]>[1],
+    generation = lifecycleGeneration,
+  ) => {
+    if (!isCurrentGeneration(generation)) return false;
+    try {
+      pi.sendMessage(message, options);
+      return true;
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.includes("extension ctx is stale")
+      )
+        return false;
+      throw error;
+    }
+  };
 
   const getStore = (cwd: string) => {
     if (!store || store.dir !== path.join(cwd, ".pi-duo"))
@@ -194,8 +218,11 @@ export default function piDuo(pi: ExtensionAPI) {
     importance: "normal" | "important" | "decision" = "important",
     triggerTurn = false,
   ) => {
+    const generation = lifecycleGeneration;
+    if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
     if (!store || !config) return "Duo is not initialized";
     const blocked = await guard.check(store, "tony", content, config);
+    if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
     if (blocked) return blocked;
     guard.recordPeerMessage();
     tonySentSequence++;
@@ -207,7 +234,8 @@ export default function piDuo(pi: ExtensionAPI) {
       importance,
       userTurn: guard.turn,
     });
-    pi.sendMessage(
+    if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
+    sendMessageSafely(
       {
         customType: "pi-duo-peer",
         content: `[Tony]\n${content}`,
@@ -217,6 +245,7 @@ export default function piDuo(pi: ExtensionAPI) {
       triggerTurn
         ? { triggerTurn: true, deliverAs: "steer" }
         : { triggerTurn: false },
+      generation,
     );
     return "Message delivered to Austin's persistent session.";
   };
@@ -225,9 +254,12 @@ export default function piDuo(pi: ExtensionAPI) {
     content: string,
     importance: "normal" | "important" | "decision" = "important",
   ) => {
+    const generation = lifecycleGeneration;
+    if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
     if (!store || !config || !tony)
       return "Tony is not running. Use /duo resume.";
     const blocked = await guard.check(store, "austin", content, config);
+    if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
     if (blocked) return blocked;
     guard.recordPeerMessage();
     await store.appendMessage({
@@ -238,8 +270,9 @@ export default function piDuo(pi: ExtensionAPI) {
       userTurn: guard.turn,
     });
     const sentBefore = tonySentSequence;
-    const wasStreaming = tony.isStreaming;
-    await tony.sendCustomMessage(
+    const activeTony = tony;
+    const wasStreaming = activeTony.isStreaming;
+    await activeTony.sendCustomMessage(
       {
         customType: "pi-duo-peer",
         content: `[Austin]\n${content}`,
@@ -250,18 +283,21 @@ export default function piDuo(pi: ExtensionAPI) {
         ? { triggerTurn: true, deliverAs: "steer" }
         : triggeringDelivery(false),
     );
+    if (!isCurrentGeneration(generation) || tony !== activeTony)
+      return "Duo extension is reloading.";
     if (wasStreaming) {
       return "Message delivered into Tony's active turn. Tony is still working; no new reply is available yet. Do not treat earlier Tony text as a response to this message.";
     }
-    const outcome = latestAssistantOutcome(tony);
+    const outcome = latestAssistantOutcome(activeTony);
     if (outcome?.error) {
-      pi.sendMessage(
+      sendMessageSafely(
         {
           customType: "pi-duo-peer",
           content: `[Tony error]\n${outcome.error}`,
           display: true,
         },
         { triggerTurn: false },
+        generation,
       );
       return `Tony failed to respond: ${outcome.error}`;
     }
@@ -509,6 +545,8 @@ export default function piDuo(pi: ExtensionAPI) {
     cwd: string,
     registry: ModelRegistry,
   ): Promise<void> => {
+    const generation = lifecycleGeneration;
+    if (!isCurrentGeneration(generation)) return;
     const currentStore = getStore(cwd);
     store = currentStore;
     config = await currentStore.readConfig();
@@ -544,6 +582,7 @@ export default function piDuo(pi: ExtensionAPI) {
       ],
     });
     await loader.reload();
+    if (!isCurrentGeneration(generation)) return;
     const manager = state.agents.tony.sessionFile
       ? SessionManager.open(state.agents.tony.sessionFile)
       : SessionManager.create(cwd, path.join(currentStore.dir, "sessions"));
@@ -554,6 +593,10 @@ export default function piDuo(pi: ExtensionAPI) {
       sessionManager: manager,
     });
     const activeTony = created.session;
+    if (!isCurrentGeneration(generation)) {
+      activeTony.dispose();
+      return;
+    }
     tony = activeTony;
     if (!state.agents.tony.sessionFile)
       activeTony.sessionManager.appendSessionInfo("pi-duo · Tony");
@@ -573,35 +616,47 @@ export default function piDuo(pi: ExtensionAPI) {
     });
   };
 
-  const disposeTony = () => {
+  const disposeTony = async () => {
     tonyUnsubscribe?.();
     tonyUnsubscribe = undefined;
-    tony?.dispose();
+    const activeTony = tony;
     tony = undefined;
+    if (!activeTony) return;
+    try {
+      if (activeTony.isStreaming) await activeTony.abort();
+    } catch {
+      // Cleanup must not prevent reload or session replacement.
+    } finally {
+      activeTony.dispose();
+    }
   };
 
   const queueTonyTask = (prompt: string) => {
+    const generation = lifecycleGeneration;
     tonyQueue = tonyQueue
       .then(async () => {
-        if (!tony) return;
+        if (!isCurrentGeneration(generation) || !tony) return;
+        const activeTony = tony;
         const sentBefore = tonySentSequence;
-        await tony.sendCustomMessage(
+        await activeTony.sendCustomMessage(
           {
             customType: "pi-duo-user-task",
             content: `[Shared user task]\n${prompt}`,
             display: false,
           },
-          triggeringDelivery(tony.isStreaming),
+          triggeringDelivery(activeTony.isStreaming),
         );
-        const outcome = latestAssistantOutcome(tony);
+        if (!isCurrentGeneration(generation) || tony !== activeTony) return;
+        const outcome = latestAssistantOutcome(activeTony);
         if (outcome?.error) {
-          pi.sendMessage(
+          sendMessageSafely(
             {
               customType: "pi-duo-peer",
               content: `[Tony error]\n${outcome.error}`,
               display: true,
             },
             { triggerTurn: false },
+            generation,
           );
           return;
         }
@@ -610,13 +665,17 @@ export default function piDuo(pi: ExtensionAPI) {
           if (final) await sendToAustin(final, "important", false);
         }
       })
-      .catch((error) =>
-        pi.sendMessage({
-          customType: "pi-duo-peer",
-          content: `[Tony error]\n${error instanceof Error ? error.message : String(error)}`,
-          display: true,
-        }),
-      );
+      .catch((error) => {
+        sendMessageSafely(
+          {
+            customType: "pi-duo-peer",
+            content: `[Tony error]\n${error instanceof Error ? error.message : String(error)}`,
+            display: true,
+          },
+          undefined,
+          generation,
+        );
+      });
   };
 
   registerTools(pi, "austin");
@@ -690,7 +749,11 @@ export default function piDuo(pi: ExtensionAPI) {
     config = latestConfig;
   });
 
-  pi.on("session_shutdown", async () => disposeTony());
+  pi.on("session_shutdown", async () => {
+    extensionActive = false;
+    lifecycleGeneration++;
+    await disposeTony();
+  });
 
   pi.registerCommand("duo", {
     description: "Manage persistent Austin ↔ Tony peer collaboration",
@@ -741,7 +804,7 @@ export default function piDuo(pi: ExtensionAPI) {
         config.agentA = austinRef;
         config.agentB = peerRef;
         await currentStore.writeConfig(config);
-        disposeTony();
+        await disposeTony();
         let state = await currentStore.create(austinRef, peerRef);
         state = await currentStore.update((draft) => {
           draft.agents.austin.sessionId = ctx.sessionManager.getSessionId();
@@ -767,7 +830,7 @@ export default function piDuo(pi: ExtensionAPI) {
         return void ctx.ui.notify("No Duo session. Use /duo start.", "warning");
 
       if (command === "stop") {
-        disposeTony();
+        await disposeTony();
         await currentStore.update((draft) => {
           draft.status = "stopped";
         });
@@ -785,12 +848,14 @@ export default function piDuo(pi: ExtensionAPI) {
           austinFile
         ) {
           await ctx.switchSession(austinFile, {
-            withSession: async (newCtx) =>
-              ensureTony(newCtx.cwd, newCtx.modelRegistry),
+            withSession: async (newCtx) => {
+              // The new extension instance restores Tony from session_start.
+              newCtx.ui.notify("Duo resumed", "info");
+            },
           });
-        } else {
-          await ensureTony(ctx.cwd, ctx.modelRegistry);
+          return;
         }
+        await ensureTony(ctx.cwd, ctx.modelRegistry);
         ctx.ui.notify("Duo resumed", "info");
       } else if (command === "goal") {
         const goal = args.slice("goal".length).trim();
