@@ -37,6 +37,7 @@ export class LoopGuard {
     from: AgentId,
     content: string,
     config: DuoConfig,
+    importance: "normal" | "important" | "decision" = "normal",
   ): Promise<string | undefined> {
     if (this.sentThisTurn >= config.maxPeerMessagesPerTurn) {
       return `Peer-message budget exhausted (${config.maxPeerMessagesPerTurn} this user turn). Continue independently or wait for the user.`;
@@ -54,6 +55,16 @@ export class LoopGuard {
       );
     if (duplicate)
       return "Suppressed as substantially similar to a recent message from this agent.";
+    const reservedImportantSlot = Math.max(
+      0,
+      config.maxPeerMessagesPerTurn - 1,
+    );
+    if (
+      importance === "normal" &&
+      this.sentThisTurn >= reservedImportantSlot
+    ) {
+      return "Normal peer-message budget exhausted; the final slot is reserved for an important result, blocker, or decision.";
+    }
     return undefined;
   }
 

@@ -32,6 +32,7 @@ You are one of two peer coding agents working on the same goal. Your peer is an 
 Do not agree automatically. Challenge weak assumptions. Resolve disagreement with a discriminating test, code inspection, or log inspection instead of prolonged argument.
 Share important discoveries, evidence, and decisions. Avoid acknowledgements with no new information. Do not wait for consensus on obvious low-risk actions.
 Never run sleep commands or poll while waiting for the peer. Send your current work with duo_send and end the turn; a later peer message will trigger another turn.
+A Tony-to-Austin workspace release or transfer automatically wakes Austin; do not spend another peer message merely repeating that lock handoff.
 For consequential architecture changes, request peer review when practical. Use duo_send selectively; the peer has an independent persistent context.`;
 
 const SendSchema = Type.Object({
@@ -221,7 +222,13 @@ export default function piDuo(pi: ExtensionAPI) {
     const generation = lifecycleGeneration;
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
     if (!store || !config) return "Duo is not initialized";
-    const blocked = await guard.check(store, "tony", content, config);
+    const blocked = await guard.check(
+      store,
+      "tony",
+      content,
+      config,
+      importance,
+    );
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
     if (blocked) return blocked;
     guard.recordPeerMessage();
@@ -258,7 +265,13 @@ export default function piDuo(pi: ExtensionAPI) {
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
     if (!store || !config || !tony)
       return "Tony is not running. Use /duo resume.";
-    const blocked = await guard.check(store, "austin", content, config);
+    const blocked = await guard.check(
+      store,
+      "austin",
+      content,
+      config,
+      importance,
+    );
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
     if (blocked) return blocked;
     guard.recordPeerMessage();
@@ -313,6 +326,41 @@ export default function piDuo(pi: ExtensionAPI) {
       return `Tony replied:\n${final}`;
     }
     return "Tony completed the turn without returning any text.";
+  };
+
+  const notifyAustinOfWorkspaceHandoff = async (
+    state: DuoState,
+    action: "release" | "transfer",
+  ) => {
+    const generation = lifecycleGeneration;
+    if (!store || !isCurrentGeneration(generation)) return;
+    const content =
+      action === "release"
+        ? "[Workspace handoff]\nTony released the workspace write lock. Austin may continue and inspect Tony's completed work."
+        : `[Workspace handoff]\nTony transferred the workspace write lock to ${state.workspaceOwner ? agentName(state.workspaceOwner) : "nobody"}.`;
+    let message: Awaited<ReturnType<DuoStore["appendMessage"]>> | undefined;
+    try {
+      message = await store.appendMessage({
+        from: "tony",
+        to: "austin",
+        content,
+        importance: "important",
+        userTurn: guard.turn,
+      });
+    } catch {
+      // A lock handoff must still wake Austin if the audit append fails.
+    }
+    if (!isCurrentGeneration(generation)) return;
+    sendMessageSafely(
+      {
+        customType: "pi-duo-peer",
+        content,
+        display: true,
+        details: message,
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+      generation,
+    );
   };
 
   const registerTools = (api: ExtensionAPI, actor: AgentId) => {
@@ -492,9 +540,17 @@ export default function piDuo(pi: ExtensionAPI) {
             draft.workspaceOwner = params.to;
           }
         });
+        let resultState = state;
+        if (
+          actor === "tony" &&
+          (params.action === "release" || params.action === "transfer")
+        ) {
+          await notifyAustinOfWorkspaceHandoff(state, params.action);
+          resultState = (await store.readState()) ?? state;
+        }
         return result(
-          `Workspace write owner: ${state.workspaceOwner ?? "none"}`,
-          state,
+          `Workspace write owner: ${resultState.workspaceOwner ?? "none"}`,
+          resultState,
         );
       },
     });

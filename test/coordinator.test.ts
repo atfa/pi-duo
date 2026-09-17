@@ -52,8 +52,23 @@ test("loop guard enforces duplicate, total, and consecutive limits", async () =>
         "",
       /similar/,
     );
+    assert.match(
+      (await guard.check(
+        store,
+        "tony",
+        "routine coordination",
+        config,
+      )) ?? "",
+      /final slot is reserved/,
+    );
     assert.equal(
-      await guard.check(store, "tony", "independent counterexample", config),
+      await guard.check(
+        store,
+        "tony",
+        "independent counterexample",
+        config,
+        "important",
+      ),
       undefined,
     );
     guard.recordPeerMessage();
