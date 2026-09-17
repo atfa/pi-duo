@@ -1,0 +1,14 @@
+{
+  "agentA": {
+    "provider": "your-austin-provider",
+    "modelId": "your-austin-model"
+  },
+  "agentB": {
+    "provider": "your-tony-provider",
+    "modelId": "your-tony-model"
+  },
+  "maxPeerMessagesPerTurn": 6,
+  "maxConsecutivePeerTurns": 3,
+  "similarityThreshold": 0.9,
+  "autoDispatch": true
+}
