@@ -5,11 +5,34 @@ export type TriggerDelivery =
   | { triggerTurn: true }
   | { triggerTurn: true; deliverAs: "followUp" };
 
+export type ControlPlaneDelivery =
+  | { triggerTurn: true }
+  | { triggerTurn: true; deliverAs: "steer" };
+
 /** Idle sessions must not use nextTurn: Pi queues it without starting an agent turn. */
 export function triggeringDelivery(isStreaming: boolean): TriggerDelivery {
   return isStreaming
     ? { triggerTurn: true, deliverAs: "followUp" }
     : { triggerTurn: true };
+}
+
+/** Control-plane handoffs must wake an idle peer and interrupt a streaming peer. */
+export function controlPlaneDelivery(
+  isStreaming: boolean,
+): ControlPlaneDelivery {
+  return isStreaming
+    ? { triggerTurn: true, deliverAs: "steer" }
+    : { triggerTurn: true };
+}
+
+export function workspaceHandoffRecipient(
+  actor: AgentId,
+  action: "release" | "transfer",
+  workspaceOwner: AgentId | null,
+): AgentId | undefined {
+  const peer = actor === "austin" ? "tony" : "austin";
+  if (action === "release") return peer;
+  return workspaceOwner === peer ? peer : undefined;
 }
 
 export interface LoopGuardBlock {

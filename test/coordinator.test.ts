@@ -3,7 +3,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { LoopGuard, triggeringDelivery } from "../src/coordinator.js";
+import {
+  controlPlaneDelivery,
+  LoopGuard,
+  triggeringDelivery,
+  workspaceHandoffRecipient,
+} from "../src/coordinator.js";
 import { DEFAULT_CONFIG, DuoStore } from "../src/store.js";
 
 test("idle delivery triggers immediately instead of being parked for a later turn", () => {
@@ -11,6 +16,28 @@ test("idle delivery triggers immediately instead of being parked for a later tur
   assert.deepEqual(triggeringDelivery(true), {
     triggerTurn: true,
     deliverAs: "followUp",
+  });
+});
+
+test("workspace handoffs route symmetrically through the control plane", () => {
+  assert.equal(
+    workspaceHandoffRecipient("austin", "transfer", "tony"),
+    "tony",
+  );
+  assert.equal(
+    workspaceHandoffRecipient("tony", "transfer", "austin"),
+    "austin",
+  );
+  assert.equal(workspaceHandoffRecipient("austin", "release", null), "tony");
+  assert.equal(workspaceHandoffRecipient("tony", "release", null), "austin");
+  assert.equal(
+    workspaceHandoffRecipient("austin", "transfer", "austin"),
+    undefined,
+  );
+  assert.deepEqual(controlPlaneDelivery(false), { triggerTurn: true });
+  assert.deepEqual(controlPlaneDelivery(true), {
+    triggerTurn: true,
+    deliverAs: "steer",
   });
 });
 

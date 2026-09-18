@@ -10,7 +10,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { LoopGuard, triggeringDelivery } from "./src/coordinator.js";
+import {
+  controlPlaneDelivery,
+  LoopGuard,
+  triggeringDelivery,
+  workspaceHandoffRecipient,
+} from "./src/coordinator.js";
 import {
   DuoStore,
   formatSharedContext,
@@ -32,7 +37,7 @@ You are one of two peer coding agents working on the same goal. Your peer is an 
 Do not agree automatically. Challenge weak assumptions. Resolve disagreement with a discriminating test, code inspection, or log inspection instead of prolonged argument.
 Share important discoveries, evidence, and decisions. Avoid acknowledgements with no new information. Do not wait for consensus on obvious low-risk actions. If duo_send reports that a message was saved without triggering a turn, do not resend it; the peer will see it in persistent context later.
 Never run sleep commands or poll while waiting for the peer. Send your current work with duo_send and end the turn; a later peer message will trigger another turn.
-A Tony-to-Austin workspace release or transfer automatically wakes Austin; do not spend another peer message merely repeating that lock handoff.
+A workspace release or transfer automatically wakes the peer in either direction; do not spend another peer message merely repeating that lock handoff.
 For consequential architecture changes, request peer review when practical. Use duo_send selectively; the peer has an independent persistent context.`;
 
 const SendSchema = Type.Object({
@@ -300,8 +305,7 @@ export default function piDuo(pi: ExtensionAPI) {
       triggerTurn: false,
     };
     if (!deferred) {
-      if (wasStreaming)
-        delivery = { triggerTurn: true, deliverAs: "steer" };
+      if (wasStreaming) delivery = { triggerTurn: true, deliverAs: "steer" };
       else delivery = triggeringDelivery(false);
     }
     await activeTony.sendCustomMessage(
@@ -348,39 +352,63 @@ export default function piDuo(pi: ExtensionAPI) {
     return "Tony completed the turn without returning any text.";
   };
 
-  const notifyAustinOfWorkspaceHandoff = async (
+  const notifyPeerOfWorkspaceHandoff = async (
+    actor: AgentId,
+    recipient: AgentId,
     state: DuoState,
     action: "release" | "transfer",
-  ) => {
+  ): Promise<boolean> => {
     const generation = lifecycleGeneration;
-    if (!store || !isCurrentGeneration(generation)) return;
-    const content =
-      action === "release"
-        ? "[Workspace handoff]\nTony released the workspace write lock. Austin may continue and inspect Tony's completed work."
-        : `[Workspace handoff]\nTony transferred the workspace write lock to ${state.workspaceOwner ? agentName(state.workspaceOwner) : "nobody"}.`;
+    if (!store || !isCurrentGeneration(generation)) return false;
+    const actorName = agentName(actor);
+    const recipientName = agentName(recipient);
+    let content: string;
+    if (action === "release") {
+      content = `[Workspace handoff]\n${actorName} released the workspace write lock. ${recipientName} may acquire it and continue.`;
+    } else {
+      const ownerName = state.workspaceOwner
+        ? agentName(state.workspaceOwner)
+        : "nobody";
+      content = `[Workspace handoff]\n${actorName} transferred the workspace write lock to ${ownerName}. ${recipientName} should continue the pending work now.`;
+    }
+    // Workspace ownership is a control-plane event and intentionally bypasses LoopGuard.
     let message: Awaited<ReturnType<DuoStore["appendMessage"]>> | undefined;
     try {
       message = await store.appendMessage({
-        from: "tony",
-        to: "austin",
+        from: actor,
+        to: recipient,
         content,
         importance: "important",
         userTurn: guard.turn,
       });
     } catch {
-      // A lock handoff must still wake Austin if the audit append fails.
+      // A lock handoff must still wake the peer if the audit append fails.
     }
-    if (!isCurrentGeneration(generation)) return;
-    sendMessageSafely(
+    if (!isCurrentGeneration(generation)) return false;
+    if (recipient === "austin") {
+      return sendMessageSafely(
+        {
+          customType: "pi-duo-peer",
+          content,
+          display: true,
+          details: message,
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+        generation,
+      );
+    }
+    const activeTony = tony;
+    if (!activeTony) return false;
+    await activeTony.sendCustomMessage(
       {
         customType: "pi-duo-peer",
         content,
-        display: true,
+        display: false,
         details: message,
       },
-      { triggerTurn: true, deliverAs: "steer" },
-      generation,
+      controlPlaneDelivery(activeTony.isStreaming),
     );
+    return isCurrentGeneration(generation) && tony === activeTony;
   };
 
   const registerTools = (api: ExtensionAPI, actor: AgentId) => {
@@ -561,15 +589,28 @@ export default function piDuo(pi: ExtensionAPI) {
           }
         });
         let resultState = state;
-        if (
-          actor === "tony" &&
-          (params.action === "release" || params.action === "transfer")
-        ) {
-          await notifyAustinOfWorkspaceHandoff(state, params.action);
-          resultState = (await store.readState()) ?? state;
+        let handoffStatus = "";
+        if (params.action === "release" || params.action === "transfer") {
+          const recipient = workspaceHandoffRecipient(
+            actor,
+            params.action,
+            state.workspaceOwner,
+          );
+          if (recipient) {
+            const delivered = await notifyPeerOfWorkspaceHandoff(
+              actor,
+              recipient,
+              state,
+              params.action,
+            );
+            handoffStatus = delivered
+              ? ` ${agentName(recipient)} was awakened through the workspace control plane.`
+              : ` ${agentName(recipient)} could not be awakened; resume Duo before relying on the handoff.`;
+            resultState = (await store.readState()) ?? state;
+          }
         }
         return result(
-          `Workspace write owner: ${resultState.workspaceOwner ?? "none"}`,
+          `Workspace write owner: ${resultState.workspaceOwner ?? "none"}.${handoffStatus}`,
           resultState,
         );
       },
