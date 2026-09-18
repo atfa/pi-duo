@@ -59,10 +59,7 @@ export class LoopGuard {
       0,
       config.maxPeerMessagesPerTurn - 1,
     );
-    if (
-      importance === "normal" &&
-      this.sentThisTurn >= reservedImportantSlot
-    ) {
+    if (importance === "normal" && this.sentThisTurn >= reservedImportantSlot) {
       return "Normal peer-message budget exhausted; the final slot is reserved for an important result, blocker, or decision.";
     }
     return undefined;
