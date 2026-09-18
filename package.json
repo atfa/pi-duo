@@ -3,17 +3,35 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Persistent peer-agent collaboration extension for Pi Coding Agent",
+  "description": "Two persistent peer agents collaborating inside Pi Coding Agent",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "coding-agent",
+    "multi-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/atfa/pi-duo.git"
+  },
+  "homepage": "https://github.com/atfa/pi-duo#readme",
+  "bugs": {
+    "url": "https://github.com/atfa/pi-duo/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "image": "https://raw.githubusercontent.com/atfa/pi-duo/main/assets/pi-duo-xhs.png"
+  },
   "scripts": {
     "check": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts"
   },
-  "dependencies": {
-    "typebox": ">=1.3.7"
-  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.85.1",
-    "@earendil-works/pi-tui": ">=0.85.1"
+    "@earendil-works/pi-tui": ">=0.85.1",
+    "typebox": "*"
   },
   "devDependencies": {
     "@types/node": "*",

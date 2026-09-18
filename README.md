@@ -1,110 +1,538 @@
-# pi-duo
+<p align="center">
+  <img src="assets/pi-duo-xhs.png" alt="pi-duo — one Pi, two persistent agents" width="360">
+</p>
 
-A pure extension for Pi Coding Agent that keeps two peer agents in one project:
+<h1 align="center">pi-duo</h1>
 
-- **Austin** — the current foreground Pi session
-- **Tony** — an independent background Pi SDK `AgentSession`
+<p align="center">
+  让两个独立、可恢复的 Pi Coding Agent 在同一个项目里协作。<br>
+  <strong>Austin</strong> 在前台实现，<strong>Tony</strong> 在后台调查、测试与审查。
+</p>
 
-Both retain separate Pi conversation histories. They share only the workspace, goal, todo, decisions, and selected peer messages.
+<p align="center">
+  <a href="https://github.com/atfa/pi-duo"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-atfa%2Fpi--duo-181717?logo=github"></a>
+  <img alt="Pi" src="https://img.shields.io/badge/Pi-%E2%89%A5%200.85.1-7C3AED">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.1.0_beta-00C2A8">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-15%20passing-22C55E">
+</p>
 
-## Requirements
+> **Beta 提示**：pi-duo 已在真实项目中完成持久会话、后台协作、写入保护、恢复和消息预算测试，但仍建议在 Git 仓库或一次性分支中使用。它不是操作系统级沙箱。
 
-- Pi Coding Agent 0.85.1 or newer
-- Two models already configured in Pi's normal provider/model configuration
+## 为什么需要 pi-duo？
 
-No provider or model is hardcoded.
+普通 subagent 往往是一次性调用：主 Agent 提问，子 Agent 返回一段结果，然后上下文消失。pi-duo 采用不同的方式：
 
-## Install
+- Austin 和 Tony 都是有独立历史的、可恢复的 Pi session；
+- peer 消息进入对方真实 session/context，而不是只写到一个 Markdown 文件；
+- 两人共享目标、todo、决策、workspace ownership 和精选消息；
+- 不复制完整 conversation，避免共享状态无限膨胀；
+- 默认只有 Austin 修改项目文件，Tony 专注独立验证，降低冲突和锁争夺；
+- 通过消息预算、重复抑制和 deferred 投递阻止 Agent 无限互聊。
+
+```mermaid
+flowchart LR
+    U[用户] --> A[Austin\n前台 Pi session]
+    A <-->|精选 peer 消息| T[Tony\n后台 Pi session]
+    A --> W[项目 workspace]
+    T -. 默认只读分析/测试 .-> W
+    A <--> S[.pi-duo\n目标 · todo · 决策 · 消息]
+    T <--> S
+```
+
+## 功能概览
+
+- **两个持久 Agent**：Austin 使用当前前台 Pi session；Tony 使用后台 SDK `AgentSession`。
+- **可选模型组合**：两个角色可以使用同一模型，也可以使用不同 provider/model。
+- **真实 context 通信**：`duo_send` 把消息写入 peer 的持久会话。
+- **后台自动协作**：默认每条普通用户任务都会同时派发给 Tony。
+- **共享工作面**：goal、todo、decisions、消息审计和 workspace owner 持久化在项目内。
+- **默认单写者**：`austin-only` 模式固定 Austin 为项目文件写入者。
+- **高级可转移写锁**：`transferable` 模式允许双方显式交接 workspace ownership。
+- **循环保护**：总消息预算、连续 peer-only 限制、相似消息抑制、关键消息 deferred 槽。
+- **可靠恢复**：`/duo stop` 保留历史，`/duo resume` 恢复两个 session。
+- **并发安全**：revision、原子 rename、跨进程锁和 stale-lock recovery。
+
+## 环境要求
+
+- [Pi Coding Agent](https://github.com/badlogic/pi-mono) `0.85.1` 或更高版本；
+- Node.js 环境（Pi 安装 Git package 时会安装依赖）；
+- 至少一个已经在 Pi 中配置并可调用的模型；
+- 若 Austin 与 Tony 使用不同模型，需要两个模型都能被当前 Pi 配置访问。
+
+pi-duo 不内置 API Key，也不绑定 provider。
+
+## 安装
+
+### 方式一：从 GitHub 安装（推荐）
 
 ```bash
-cd /path/to/pi-duo
+pi install git:github.com/atfa/pi-duo
+```
+
+如果 Pi 当前正在运行，执行：
+
+```text
+/reload
+```
+
+以后更新所有已安装扩展：
+
+```bash
+pi update --extensions
+```
+
+移除：
+
+```bash
+pi remove git:github.com/atfa/pi-duo
+```
+
+> Pi package 拥有与当前用户相同的系统权限。安装第三方扩展前应审查源码。
+
+### 方式二：临时试用，不写入安装配置
+
+```bash
+pi -e git:github.com/atfa/pi-duo
+```
+
+退出本次 Pi 进程后，临时 package 不再加载。
+
+### 方式三：本地开发 checkout
+
+```bash
+git clone https://github.com/atfa/pi-duo.git
+cd pi-duo
 npm install
+pi install "$PWD"
+```
+
+也可以使用 Pi extension discovery 的符号链接方式：
+
+```bash
 mkdir -p ~/.pi/agent/extensions
 ln -sfn "$PWD" ~/.pi/agent/extensions/pi-duo
 ```
 
-Then run `/reload` in Pi (or restart Pi).
+修改源码后在 Pi 中运行 `/reload`。
 
-For this development checkout, the symlink can be installed directly because its dependencies are already available locally.
+## 5 分钟快速开始
 
-## Start
+### 1. 进入目标项目并启动 Pi
 
-Austin uses the current Pi model. Select Tony interactively:
+```bash
+cd /path/to/your-project
+pi
+```
+
+建议项目已经初始化 Git，并且 `.gitignore` 包含：
+
+```gitignore
+.pi-duo/
+```
+
+`.pi-duo/` 可能包含 session 历史、模型输出和项目上下文，不建议提交。
+
+### 2. 选择 Austin 的模型
+
+Austin 就是当前前台 Pi。先用 Pi 的模型选择功能选好 Austin 的模型。
+
+### 3. 启动 Duo
+
+交互选择 Tony 模型：
+
+```text
+/duo start --goal "修复支付回调的并发重复入账问题"
+```
+
+或直接指定：
+
+```text
+/duo start --peer anthropic/claude-sonnet-4-5 --goal "修复支付回调的并发重复入账问题"
+```
+
+`provider/model` 中 model 部分可以继续包含 `/`，例如：
+
+```text
+/duo start --peer openrouter/anthropic/claude-sonnet-4.5
+```
+
+### 4. 确认状态
+
+```text
+/duo status
+```
+
+默认应看到类似：
+
+```text
+Duo: active
+Current role: Austin (foreground agent; not Tony)
+Write policy: austin-only
+Workspace write owner: Austin
+```
+
+### 5. 正常描述任务
+
+之后像平常一样向 Pi 提交任务即可。`autoDispatch=true` 时：
+
+1. Austin 在前台处理用户任务；
+2. Tony 在后台收到相同任务和共享状态；
+3. Tony 独立读代码、运行只读测试、寻找反例；
+4. Tony 通过 `duo_send` 把关键证据发给 Austin；
+5. Austin 实现并在关键 checkpoint 请求 Tony 复核；
+6. 最终 goal、todo 和 decisions 留在 `.pi-duo/` 中。
+
+## `/duo` 命令完整说明
+
+### 查看状态
+
+```text
+/duo
+/duo status
+```
+
+显示运行状态、当前角色、共享目标、todo 进度、两个模型/session、写入策略、workspace owner、消息数和最后活动时间。
+
+### 创建新的 Duo
 
 ```text
 /duo start
-```
-
-Or specify Tony explicitly:
-
-```text
 /duo start --peer provider/model
-/duo start --peer provider/model --goal "Fix the parser race"
+/duo start --goal "目标"
+/duo start --peer provider/model --goal "目标"
 ```
 
-The selected models are saved to `<project>/.pi-duo/config.json`. You may instead create that file from [`config.example.json`](config.example.json): `agentA` specifies Austin and `agentB` specifies Tony. Because Austin is the already-running foreground session, select the configured `agentA` model in Pi before `/duo start`; a mismatch is rejected. If `agentA` is initially omitted, `/duo start` records the current model, and later Pi model selections keep it synchronized.
+- 当前 Pi session 成为 Austin；
+- `--peer` 指定 Tony 模型；省略时使用 `config.json` 的 `agentB`，仍未配置则弹出模型选择器；
+- `--goal` 设置初始共享目标；
+- Austin 当前模型必须与已配置的 `agentA` 一致。
 
-## Commands
+> **注意**：`/duo start` 创建新的共享 Duo 状态。已有会话应优先使用 `/duo resume`，避免重新初始化 goal、todo 和 decisions。
+
+### 暂停
 
 ```text
-/duo                  # status
-/duo status
-/duo start [--peer provider/model] [--goal "..."]
-/duo goal <new goal>
-/duo stop             # preserve both histories
-/duo resume           # reopen Austin's and Tony's saved Pi sessions
-/duo config writePolicy=austin-only
-/duo config autoDispatch=false maxPeerMessagesPerTurn=4 maxDeferredMessagesPerTurn=2
+/duo stop
 ```
 
-Agent tools:
+停止后台 Tony，但保留 Austin/Tony session 和全部 `.pi-duo` 状态。
 
-- `duo_send` — send a selected message into the peer's real session context
-- `duo_status`
-- `duo_goal`
-- `duo_todo`
-- `duo_decisions`
-- `duo_workspace` — manage write ownership
+### 恢复
 
-## Persistence
+```text
+/duo resume
+```
 
-Project-local state is stored under `.pi-duo/`:
+恢复已保存的 Austin 前台 session 和 Tony 后台 session。若当前 Pi session 不是原 Austin session，pi-duo 会切换回保存的 session。
 
-- `config.json` — model selection, write policy, and loop limits
-- `state.json` — goal, todo, decisions, session metadata, status
-- `messages.jsonl` — selected peer-message audit log
-- `decisions.md` — readable durable decisions
-- `sessions/` — Tony's native Pi JSONL session history
+### 查看或修改目标
 
-Austin's history remains in Pi's normal session directory. `/duo resume` switches back to that saved foreground session when necessary.
+```text
+/duo goal
+/duo goal "新的共享目标"
+```
 
-State changes use a revision, a cross-process lock directory, atomic file replacement, and stale-lock recovery. Conversation histories are not copied into shared state.
+### 修改配置
 
-## Runtime behavior
+```text
+/duo config key=value [key=value ...]
+```
 
-With `autoDispatch: true`, each normal user task is also delivered to Tony with an explicit role reminder. Austin and Tony can investigate concurrently and communicate only when useful. Under the default `austin-only` policy, Austin implements while Tony acts as the background investigator and reviewer. Important Tony messages appear in the main UI as `[Tony]` entries.
+示例：
 
-Loop protection includes:
+```text
+/duo config autoDispatch=false
+/duo config writePolicy=transferable
+/duo config maxPeerMessagesPerTurn=4 maxDeferredMessagesPerTurn=2
+/duo config maxConsecutivePeerTurns=2 similarityThreshold=0.92
+```
 
-- maximum peer messages per user turn
-- maximum consecutive peer-only messages without material tool activity
-- similarity suppression against recent messages
+修改后会显示完整生效配置。
 
-When the per-turn total is exhausted, up to `maxDeferredMessagesPerTurn` additional `important` or `decision` messages are still written to the peer's persistent context and `messages.jsonl`, but they do not trigger another model turn. Normal-priority overflow and further high-priority overflow are rejected until the next user input. Duplicate suppression still applies, so retrying the same deferred report does not consume another slot. The default of two slots preserves a late implementation checkpoint and a later critical correction without allowing an unbounded peer loop.
+## 配置文件与全部开关
 
-The default `writePolicy` is `austin-only`: Austin is the sole project-file writer, while Tony reads, investigates, tests, challenges assumptions, and sends consolidated file-and-line findings for Austin to implement. `duo_workspace` cannot release or transfer ownership in this mode, and stale project state is normalized back to Austin. Shared `.pi-duo` state and Tony's own session files remain writable because they are extension metadata, not project edits.
+每个项目使用独立配置：
 
-Set `writePolicy=transferable` to enable the advanced multi-writer workflow. In that mode, `edit`, `write`, and recognizable mutating shell commands are blocked for the non-owner, and agents transfer ownership with `duo_workspace`. Release and transfer are bidirectional control-plane events that dispatch a peer wake-up even when message budgets are exhausted. The tool returns the committed ownership snapshot without waiting for the peer's full turn.
+```text
+<project>/.pi-duo/config.json
+```
 
-The shell classifier is intentionally conservative and is not an OS sandbox: an arbitrary script or test command may still create project files. Use Git review and disposable branches for untrusted or high-risk tasks.
+完整示例见 [`config.example.json`](config.example.json)：
 
-## Offline verification
+```json
+{
+  "agentA": {
+    "provider": "your-austin-provider",
+    "modelId": "your-austin-model"
+  },
+  "agentB": {
+    "provider": "your-tony-provider",
+    "modelId": "your-tony-model"
+  },
+  "maxPeerMessagesPerTurn": 6,
+  "maxDeferredMessagesPerTurn": 2,
+  "maxConsecutivePeerTurns": 3,
+  "similarityThreshold": 0.9,
+  "autoDispatch": true,
+  "writePolicy": "austin-only"
+}
+```
 
-These do not call a remote model API:
+| 配置项 | 默认值 | `/duo config` | 说明 |
+| --- | --- | --- | --- |
+| `agentA` | 首次启动时记录 | 否 | Austin 的 `{provider, modelId}`。Austin 是当前前台模型。 |
+| `agentB` | 交互选择或 `--peer` | 否 | Tony 的 `{provider, modelId}`。 |
+| `autoDispatch` | `true` | 是 | `true`：每个普通用户任务自动派发给 Tony；`false`：只在 Austin 显式调用 `duo_send` 时联系 Tony。 |
+| `writePolicy` | `"austin-only"` | 是 | `austin-only` 或 `transferable`，详见下文。 |
+| `maxPeerMessagesPerTurn` | `6` | 是 | 每个用户回合最多触发多少条 peer 消息。最后一个触发槽保留给 `important`/`decision`。 |
+| `maxDeferredMessagesPerTurn` | `2` | 是 | 触发预算耗尽后，额外允许持久化多少条高优先级消息；这些消息不会立即启动新模型回合。 |
+| `maxConsecutivePeerTurns` | `3` | 是 | 没有实质工具活动时，允许连续发生的 peer-only 消息数量。 |
+| `similarityThreshold` | `0.9` | 是 | `0–1` 相似度阈值；消息相似度达到阈值即抑制。越低越激进，越高越只拦截近似重复。 |
+
+布尔值使用小写 `true`/`false`。配置数值应使用合理的正数；过大的消息预算会增加费用和上下文噪声。
+
+旧配置缺少新字段时会自动补默认值；非法 `writePolicy` 会回退到 `austin-only`。
+
+## 两种写入策略
+
+### `austin-only`（默认、推荐）
+
+```text
+/duo config writePolicy=austin-only
+```
+
+- Austin 是唯一项目文件写入者；
+- Tony 负责只读调查、测试、反例、审查和验收建议；
+- Tony 的 `edit`、`write` 以及可识别的 mutating shell 命令会被阻止；
+- workspace owner 固定为 Austin；
+- `release`、`transfer` 和 Tony `acquire` 不可用；
+- `.pi-duo` 共享元数据和 Tony session 持久化不算项目文件修改。
+
+这种模式减少锁争夺、并行覆盖和控制面来回交接，适合大多数任务。
+
+Tony 编写临时验证时，推荐使用不落盘的命令：
 
 ```bash
-npm run check
-npm test
+node -e '/* inline check */'
+node --input-type=module <<'NODE'
+// check code from stdin
+NODE
 ```
 
-To perform the smallest live check, start Pi in a disposable project, run `/duo start`, then `/duo status`. A normal prompt will call both configured models when `autoDispatch` is enabled.
+### `transferable`（高级）
+
+```text
+/duo config writePolicy=transferable
+```
+
+- workspace owner 可以是 Austin、Tony 或 `none`；
+- 只有当前 owner 可以执行可识别的项目写操作；
+- Agent 可通过 `duo_workspace acquire/release/transfer` 交接；
+- release/transfer 属于控制面事件，即使普通消息预算耗尽也会唤醒 peer；
+- 工具会先返回已提交的 ownership 快照，不等待 peer 完整回合。
+
+仅在双方确实需要分阶段写入时使用。当前版本不提供 Git worktree 自动隔离，也不建议双方同时写文件。
+
+## Agent 可调用的工具
+
+这些工具由模型自动调用，用户通常不需要手工操作。
+
+### `duo_send`
+
+向 peer 的真实持久 context 发送精选消息。
+
+参数：
+
+- `message`：消息正文；
+- `importance`：`normal`、`important` 或 `decision`。
+
+`important` 和 `decision` 可以使用保留槽，并在总预算耗尽后进入 deferred 持久化槽。
+
+### `duo_status`
+
+读取当前角色、goal、todo、模型、session、策略、workspace owner 和活动状态。
+
+### `duo_goal`
+
+- `get`：读取目标；
+- `set`：原子更新目标；
+- 可选 `expectedRevision` 用于 optimistic concurrency。
+
+### `duo_todo`
+
+支持：
+
+- `list`
+- `add`
+- `update`
+- `remove`
+
+状态值：
+
+- `pending`
+- `in_progress`
+- `done`
+- `blocked`
+
+todo 可指定 `owner: austin | tony`，并支持 `expectedRevision` 防止并发覆盖。
+
+### `duo_decisions`
+
+列出或添加持久决策；每条决策可以包含 `evidence`，并自动记录 author 和时间。
+
+### `duo_workspace`
+
+- `status`
+- `acquire`
+- `release`
+- `transfer`（需要 `to: austin | tony`）
+
+在 `austin-only` 模式中只有状态查询和 Austin ownership 归一化有效；完整交接仅用于 `transferable`。
+
+## 消息预算与循环保护
+
+一次用户输入定义一个 user turn。默认流程：
+
+1. 最多触发 6 条 peer 消息；
+2. 普通消息只能使用前 5 个槽；
+3. 最后一个触发槽保留给关键结果或决策；
+4. 预算耗尽后，最多再保存 2 条 `important`/`decision`；
+5. deferred 消息进入 peer 持久 context 和 `messages.jsonl`，但不触发模型回合；
+6. 重复消息先经过相似度检查，因此重试同一条 deferred 消息不会继续占槽；
+7. 下一次用户输入会重置 per-turn 预算。
+
+如果工具提示消息“saved without triggering another turn”，Agent 应继续独立工作，不要重复发送。
+
+## 数据与持久化
+
+```text
+.pi-duo/
+├── config.json       # 模型、策略与预算开关
+├── state.json        # goal、todo、decisions、agent/session 元数据
+├── messages.jsonl    # 精选 peer 消息审计日志
+├── decisions.md      # 人类可读的决策记录
+├── sessions/         # Tony 的原生 Pi JSONL session
+└── .lock/            # 短暂出现的跨进程写锁目录
+```
+
+Austin 的原生 session 仍保存在 Pi 的正常 session 目录中；`state.json` 只保存引用，不复制完整 conversation。
+
+共享状态更新采用：
+
+- 单调递增 revision；
+- 可选 `expectedRevision`；
+- 临时文件 + 原子 rename；
+- 跨进程锁目录；
+- stale lock 自动恢复。
+
+## 模型选择建议
+
+- **同模型**：输出风格一致，配置简单，但认知多样性有限；
+- **不同模型**：更容易获得独立反例和不同实现视角；
+- Tony 不一定需要最昂贵的模型，擅长代码审查和测试即可；
+- provider 的订阅/免费层可能限制从 Pi 调用，先在普通 Pi session 中确认模型可用；
+- `autoDispatch=true` 会让正常任务调用两个模型，请留意费用和速率限制。
+
+## 安全边界与已知限制
+
+- pi-duo 是 Pi extension，不是容器、VM 或 OS 权限沙箱；
+- shell 分类器只能阻止可识别的写命令；测试、构建和任意脚本仍可能创建文件；
+- `austin-only` 是协作纪律和工具保护，不是恶意代码隔离；
+- 默认也会阻止 Tony 创建可识别的 `/tmp` 临时文件。可改用 inline/stdin 测试；
+- 两个 Agent 共享同一个工作目录，不提供自动 Git worktree；
+- 当前 UI 只显示前台 Austin，Tony 在后台运行；
+- deferred 消息不会立即触发模型回合；
+- 当前目标是可靠双 Agent，不支持 N-agent、投票、RAG、外部数据库或 Web UI；
+- 在不受信任的仓库中使用前，应先阅读代码并使用隔离环境。
+
+## 常见问题与排障
+
+### `/duo` 命令不存在
+
+1. 确认 package 已安装：`pi list`；
+2. 当前 Pi 中运行 `/reload`，或重启 Pi；
+3. 本地开发模式下检查 `~/.pi/agent/extensions/pi-duo` 链接。
+
+### `/duo start` 提示 Austin 模型不匹配
+
+`config.json` 已保存 `agentA`。请在 Pi 中选回该模型，或在确认要新建 Duo 后修改配置并重新开始。
+
+### Tony 模型 unavailable / provider error
+
+先在普通 Pi session 中选择并调用该模型，确认 provider 凭证、订阅权限和模型 ID 正确。pi-duo 不绕过 provider 限制。
+
+### Tony 没有自动收到任务
+
+检查：
+
+```text
+/duo status
+/duo config autoDispatch=true
+```
+
+`autoDispatch=false` 时，只有 Agent 显式调用 `duo_send` 才会联系 peer。
+
+### 消息显示 deferred
+
+当前用户回合的触发预算已经耗尽。消息已安全进入 peer context 和审计日志，但不会立即启动新回合。不要重复发送；继续当前任务或等待下一条用户输入。
+
+### Tony 的 shell 命令被阻止
+
+默认 `austin-only` 会拦截可识别写命令。Tony 应改用只读检查、inline 脚本，并把建议发给 Austin。确实需要 Tony 写入时，再显式切换到 `transferable` 并交接 ownership。
+
+### todo 已完成但状态仍 pending
+
+Austin 应在最终回复前调用 `duo_todo update` 收敛共享状态。可以在新提示中要求：“完成前核对并关闭所有共享 todo”。
+
+### 如何查看协作是否真实发生？
+
+检查：
+
+```bash
+cat .pi-duo/messages.jsonl
+cat .pi-duo/decisions.md
+```
+
+Tony 的完整历史位于 `.pi-duo/sessions/`，Austin 的完整历史保留在 Pi session 目录。
+
+## 开发与离线验证
+
+```bash
+git clone https://github.com/atfa/pi-duo.git
+cd pi-duo
+npm install
+npm run check
+npm test
+npm pack --dry-run
+```
+
+以上检查不调用远程模型 API。真实双 Agent smoke test 会产生模型调用费用，建议在一次性项目中进行。
+
+主要文件：
+
+```text
+index.ts                 extension 入口、生命周期、命令与工具
+src/store.ts             持久化、锁、原子状态与 shell 分类
+src/coordinator.ts       投递策略、LoopGuard、ownership 规则
+src/types.ts             共享类型
+test/*.test.ts           离线回归测试
+config.example.json      完整配置示例
+assets/pi-duo-xhs.png    3:4 宣传图
+```
+
+## 项目状态
+
+当前定位：**v0.1.0 beta / release candidate**。
+
+已经过以下真实场景验证：
+
+- 两个独立持久 session 的启动、停止、恢复；
+- 双向 peer context 投递；
+- reload/session replacement 后的 stale callback 隔离；
+- Austin-only 写保护；
+- transferable 双向 handoff；
+- 超预算关键消息持久化；
+- todo/decisions 收敛；
+- 两个完整浏览器小游戏项目的协作开发与独立复核。
+
+欢迎通过 [GitHub Issues](https://github.com/atfa/pi-duo/issues) 报告问题。提交 issue 时请隐藏 API Key、私有源码和 session 中的敏感内容。
