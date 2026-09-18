@@ -61,6 +61,7 @@ export interface PeerMessage {
   to: AgentId;
   content: string;
   importance: "normal" | "important" | "decision";
+  deferred?: boolean;
   timestamp: string;
   userTurn: number;
 }

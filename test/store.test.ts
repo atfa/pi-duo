@@ -97,6 +97,14 @@ test("appends peer audit records and materializes decisions markdown", async () 
       importance: "important",
       userTurn: 1,
     });
+    await store.appendMessage({
+      from: "tony",
+      to: "austin",
+      content: "Late critical finding",
+      importance: "decision",
+      deferred: true,
+      userTurn: 1,
+    });
     await store.update((state) =>
       state.decisions.push({
         id: 1,
@@ -106,7 +114,9 @@ test("appends peer audit records and materializes decisions markdown", async () 
         createdAt: new Date().toISOString(),
       }),
     );
-    assert.equal((await store.recentMessages()).length, 1);
+    const messages = await store.recentMessages();
+    assert.equal(messages.length, 2);
+    assert.equal(messages[1]?.deferred, true);
     assert.match(
       await readFile(store.decisionsPath, "utf8"),
       /Use an experiment[\s\S]*test output/,

@@ -89,6 +89,8 @@ Loop protection includes:
 - maximum consecutive peer-only messages without material tool activity
 - similarity suppression against recent messages
 
+When the per-turn total is exhausted, the first additional `important` or `decision` message is still written to the peer's persistent context and `messages.jsonl`, but it does not trigger another model turn. Further overflow and normal-priority overflow are rejected. This preserves one late critical finding without allowing an unbounded peer loop.
+
 Austin owns workspace writes initially. `edit`, `write`, and recognizable mutating shell commands are blocked for the non-owner. Agents transfer ownership with `duo_workspace`. The shell classifier is intentionally conservative but cannot prove an arbitrary command is read-only; the cooperation prompt also requires ownership discipline.
 
 ## Offline verification

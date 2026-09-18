@@ -42,18 +42,19 @@ test("loop guard enforces duplicate, total, and consecutive limits", async () =>
       userTurn: guard.turn,
     });
     assert.match(
-      (await guard.check(store, "austin", "first useful finding", config)) ??
-        "",
+      (await guard.check(store, "austin", "first useful finding", config))
+        ?.reason ?? "",
       /chain stopped|similar/,
     );
     guard.noteMaterialActivity();
     assert.match(
-      (await guard.check(store, "austin", "first useful finding", config)) ??
-        "",
+      (await guard.check(store, "austin", "first useful finding", config))
+        ?.reason ?? "",
       /similar/,
     );
     assert.match(
-      (await guard.check(store, "tony", "routine coordination", config)) ?? "",
+      (await guard.check(store, "tony", "routine coordination", config))
+        ?.reason ?? "",
       /final slot is reserved/,
     );
     assert.equal(
@@ -67,11 +68,50 @@ test("loop guard enforces duplicate, total, and consecutive limits", async () =>
       undefined,
     );
     guard.recordPeerMessage();
+    await store.appendMessage({
+      from: "tony",
+      to: "austin",
+      content: "independent counterexample",
+      importance: "important",
+      userTurn: guard.turn,
+    });
     guard.noteMaterialActivity();
-    assert.match(
-      (await guard.check(store, "tony", "third message", config)) ?? "",
-      /budget exhausted/,
+    const duplicateOverflow = await guard.check(
+      store,
+      "tony",
+      "independent counterexample",
+      config,
+      "important",
     );
+    assert.match(duplicateOverflow?.reason ?? "", /similar/);
+    assert.equal(duplicateOverflow?.persistWithoutTurn, false);
+    const blockedNormal = await guard.check(
+      store,
+      "tony",
+      "third message",
+      config,
+    );
+    assert.match(blockedNormal?.reason ?? "", /budget exhausted/);
+    assert.equal(blockedNormal?.persistWithoutTurn, false);
+    const deferredImportant = await guard.check(
+      store,
+      "tony",
+      "late critical finding",
+      config,
+      "important",
+    );
+    assert.match(deferredImportant?.reason ?? "", /budget exhausted/);
+    assert.equal(deferredImportant?.persistWithoutTurn, true);
+    guard.recordDeferredMessage();
+    const blockedSecondOverflow = await guard.check(
+      store,
+      "austin",
+      "another late critical finding",
+      config,
+      "decision",
+    );
+    assert.equal(blockedSecondOverflow?.persistWithoutTurn, false);
+    assert.match(blockedSecondOverflow?.reason ?? "", /slot is unavailable/);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

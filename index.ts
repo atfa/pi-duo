@@ -30,7 +30,7 @@ import type {
 const POLICY = `## Duo cooperation policy
 You are one of two peer coding agents working on the same goal. Your peer is an independent reasoning agent, not your subordinate.
 Do not agree automatically. Challenge weak assumptions. Resolve disagreement with a discriminating test, code inspection, or log inspection instead of prolonged argument.
-Share important discoveries, evidence, and decisions. Avoid acknowledgements with no new information. Do not wait for consensus on obvious low-risk actions.
+Share important discoveries, evidence, and decisions. Avoid acknowledgements with no new information. Do not wait for consensus on obvious low-risk actions. If duo_send reports that a message was saved without triggering a turn, do not resend it; the peer will see it in persistent context later.
 Never run sleep commands or poll while waiting for the peer. Send your current work with duo_send and end the turn; a later peer message will trigger another turn.
 A Tony-to-Austin workspace release or transfer automatically wakes Austin; do not spend another peer message merely repeating that lock handoff.
 For consequential architecture changes, request peer review when practical. Use duo_send selectively; the peer has an independent persistent context.`;
@@ -230,8 +230,10 @@ export default function piDuo(pi: ExtensionAPI) {
       importance,
     );
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
-    if (blocked) return blocked;
-    guard.recordPeerMessage();
+    const deferred = blocked?.persistWithoutTurn === true;
+    if (blocked && !deferred) return blocked.reason;
+    if (deferred) guard.recordDeferredMessage();
+    else guard.recordPeerMessage();
     tonySentSequence++;
     lastTonyDelivery = { sequence: tonySentSequence, content };
     const message = await store.appendMessage({
@@ -239,22 +241,28 @@ export default function piDuo(pi: ExtensionAPI) {
       to: "austin",
       content,
       importance,
+      deferred: deferred || undefined,
       userTurn: guard.turn,
     });
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
+    let delivery: Parameters<ExtensionAPI["sendMessage"]>[1] = {
+      triggerTurn: false,
+    };
+    if (!deferred && triggerTurn)
+      delivery = { triggerTurn: true, deliverAs: "steer" };
     sendMessageSafely(
       {
         customType: "pi-duo-peer",
-        content: `[Tony]\n${content}`,
+        content: `[Tony]${deferred ? " [saved without triggering a turn]" : ""}\n${content}`,
         display: importance !== "normal",
         details: message,
       },
-      triggerTurn
-        ? { triggerTurn: true, deliverAs: "steer" }
-        : { triggerTurn: false },
+      delivery,
       generation,
     );
-    return "Message delivered to Austin's persistent session.";
+    return deferred
+      ? `High-priority message saved in Austin's persistent context and audit log without triggering another turn. ${blocked?.reason}`
+      : "Message delivered to Austin's persistent session.";
   };
 
   const sendToTony = async (
@@ -273,31 +281,43 @@ export default function piDuo(pi: ExtensionAPI) {
       importance,
     );
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
-    if (blocked) return blocked;
-    guard.recordPeerMessage();
-    await store.appendMessage({
+    const deferred = blocked?.persistWithoutTurn === true;
+    if (blocked && !deferred) return blocked.reason;
+    if (deferred) guard.recordDeferredMessage();
+    else guard.recordPeerMessage();
+    const message = await store.appendMessage({
       from: "austin",
       to: "tony",
       content,
       importance,
+      deferred: deferred || undefined,
       userTurn: guard.turn,
     });
     const sentBefore = tonySentSequence;
     const activeTony = tony;
     const wasStreaming = activeTony.isStreaming;
+    let delivery: Parameters<AgentSession["sendCustomMessage"]>[1] = {
+      triggerTurn: false,
+    };
+    if (!deferred) {
+      if (wasStreaming)
+        delivery = { triggerTurn: true, deliverAs: "steer" };
+      else delivery = triggeringDelivery(false);
+    }
     await activeTony.sendCustomMessage(
       {
         customType: "pi-duo-peer",
-        content: `[Austin]\n${content}`,
+        content: `[Austin]${deferred ? " [saved without triggering a turn]" : ""}\n${content}`,
         display: false,
-        details: { from: "austin", importance },
+        details: message,
       },
-      wasStreaming
-        ? { triggerTurn: true, deliverAs: "steer" }
-        : triggeringDelivery(false),
+      delivery,
     );
     if (!isCurrentGeneration(generation) || tony !== activeTony)
       return "Duo extension is reloading.";
+    if (deferred) {
+      return `High-priority message saved in Tony's persistent context and audit log without triggering another turn. ${blocked?.reason}`;
+    }
     if (wasStreaming) {
       return "Message delivered into Tony's active turn. Tony is still working; no new reply is available yet. Do not treat earlier Tony text as a response to this message.";
     }

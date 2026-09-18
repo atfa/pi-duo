@@ -12,14 +12,21 @@ export function triggeringDelivery(isStreaming: boolean): TriggerDelivery {
     : { triggerTurn: true };
 }
 
+export interface LoopGuardBlock {
+  reason: string;
+  persistWithoutTurn: boolean;
+}
+
 export class LoopGuard {
   private userTurn = 0;
   private sentThisTurn = 0;
+  private deferredThisTurn = 0;
   private consecutivePeerTurns = 0;
 
   beginUserTurn(): number {
     this.userTurn += 1;
     this.sentThisTurn = 0;
+    this.deferredThisTurn = 0;
     this.consecutivePeerTurns = 0;
     return this.userTurn;
   }
@@ -38,13 +45,7 @@ export class LoopGuard {
     content: string,
     config: DuoConfig,
     importance: "normal" | "important" | "decision" = "normal",
-  ): Promise<string | undefined> {
-    if (this.sentThisTurn >= config.maxPeerMessagesPerTurn) {
-      return `Peer-message budget exhausted (${config.maxPeerMessagesPerTurn} this user turn). Continue independently or wait for the user.`;
-    }
-    if (this.consecutivePeerTurns >= config.maxConsecutivePeerTurns) {
-      return `Peer-only chain stopped (${config.maxConsecutivePeerTurns} consecutive messages without material tool activity). Run an experiment or stop.`;
-    }
+  ): Promise<LoopGuardBlock | undefined> {
     const recent = await store.recentMessages(12);
     const duplicate = recent
       .filter((message) => message.from === from)
@@ -54,13 +55,36 @@ export class LoopGuard {
           config.similarityThreshold,
       );
     if (duplicate)
-      return "Suppressed as substantially similar to a recent message from this agent.";
+      return {
+        reason:
+          "Suppressed as substantially similar to a recent message from this agent.",
+        persistWithoutTurn: false,
+      };
+    if (this.sentThisTurn >= config.maxPeerMessagesPerTurn) {
+      const mayPersist = importance !== "normal" && this.deferredThisTurn === 0;
+      return {
+        reason: mayPersist
+          ? `Peer-message budget exhausted (${config.maxPeerMessagesPerTurn} this user turn).`
+          : `Peer-message budget exhausted (${config.maxPeerMessagesPerTurn} this user turn); the context-only overflow slot is unavailable. Continue independently or wait for the user.`,
+        persistWithoutTurn: mayPersist,
+      };
+    }
+    if (this.consecutivePeerTurns >= config.maxConsecutivePeerTurns) {
+      return {
+        reason: `Peer-only chain stopped (${config.maxConsecutivePeerTurns} consecutive messages without material tool activity). Run an experiment or stop.`,
+        persistWithoutTurn: false,
+      };
+    }
     const reservedImportantSlot = Math.max(
       0,
       config.maxPeerMessagesPerTurn - 1,
     );
     if (importance === "normal" && this.sentThisTurn >= reservedImportantSlot) {
-      return "Normal peer-message budget exhausted; the final slot is reserved for an important result, blocker, or decision.";
+      return {
+        reason:
+          "Normal peer-message budget exhausted; the final slot is reserved for an important result, blocker, or decision.",
+        persistWithoutTurn: false,
+      };
     }
     return undefined;
   }
@@ -68,5 +92,9 @@ export class LoopGuard {
   recordPeerMessage(): void {
     this.sentThisTurn += 1;
     this.consecutivePeerTurns += 1;
+  }
+
+  recordDeferredMessage(): void {
+    this.deferredThisTurn += 1;
   }
 }
