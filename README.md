@@ -53,6 +53,7 @@ The selected models are saved to `<project>/.pi-duo/config.json`. You may instea
 /duo goal <new goal>
 /duo stop             # preserve both histories
 /duo resume           # reopen Austin's and Tony's saved Pi sessions
+/duo config writePolicy=austin-only
 /duo config autoDispatch=false maxPeerMessagesPerTurn=4
 ```
 
@@ -69,7 +70,7 @@ Agent tools:
 
 Project-local state is stored under `.pi-duo/`:
 
-- `config.json` — model selection and loop limits
+- `config.json` — model selection, write policy, and loop limits
 - `state.json` — goal, todo, decisions, session metadata, status
 - `messages.jsonl` — selected peer-message audit log
 - `decisions.md` — readable durable decisions
@@ -91,7 +92,11 @@ Loop protection includes:
 
 When the per-turn total is exhausted, the first additional `important` or `decision` message is still written to the peer's persistent context and `messages.jsonl`, but it does not trigger another model turn. Further overflow and normal-priority overflow are rejected. This preserves one late critical finding without allowing an unbounded peer loop.
 
-Austin owns workspace writes initially. `edit`, `write`, and recognizable mutating shell commands are blocked for the non-owner. Agents transfer ownership with `duo_workspace`. Release and transfer are bidirectional control-plane events: they dispatch a peer wake-up even when normal peer-message and deferred-message budgets are exhausted. The tool returns the committed ownership snapshot without waiting for the peer's full turn, so a later reverse handoff cannot make the original transfer look unsuccessful. The shell classifier is intentionally conservative but cannot prove an arbitrary command is read-only; the cooperation prompt also requires ownership discipline.
+The default `writePolicy` is `austin-only`: Austin is the sole project-file writer, while Tony reads, investigates, tests, challenges assumptions, and sends consolidated file-and-line findings for Austin to implement. `duo_workspace` cannot release or transfer ownership in this mode, and stale project state is normalized back to Austin. Shared `.pi-duo` state and Tony's own session files remain writable because they are extension metadata, not project edits.
+
+Set `writePolicy=transferable` to enable the advanced multi-writer workflow. In that mode, `edit`, `write`, and recognizable mutating shell commands are blocked for the non-owner, and agents transfer ownership with `duo_workspace`. Release and transfer are bidirectional control-plane events that dispatch a peer wake-up even when message budgets are exhausted. The tool returns the committed ownership snapshot without waiting for the peer's full turn.
+
+The shell classifier is intentionally conservative and is not an OS sandbox: an arbitrary script or test command may still create project files. Use Git review and disposable branches for untrusted or high-risk tasks.
 
 ## Offline verification
 

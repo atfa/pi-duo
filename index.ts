@@ -11,6 +11,8 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
+  canMutateWorkspace,
+  canUseWorkspaceAction,
   controlPlaneDelivery,
   dispatchControlPlaneTask,
   LoopGuard,
@@ -33,13 +35,22 @@ import type {
   TodoStatus,
 } from "./src/types.js";
 
-const POLICY = `## Duo cooperation policy
+const BASE_POLICY = `## Duo cooperation policy
 You are one of two peer coding agents working on the same goal. Your peer is an independent reasoning agent, not your subordinate.
 Do not agree automatically. Challenge weak assumptions. Resolve disagreement with a discriminating test, code inspection, or log inspection instead of prolonged argument.
 Share important discoveries, evidence, and decisions. Avoid acknowledgements with no new information. Do not wait for consensus on obvious low-risk actions. If duo_send reports that a message was saved without triggering a turn, do not resend it; the peer will see it in persistent context later.
 Never run sleep commands or poll while waiting for the peer. Send your current work with duo_send and end the turn; a later peer message will trigger another turn.
-A workspace release or transfer automatically wakes the peer in either direction; do not spend another peer message merely repeating that lock handoff.
 For consequential architecture changes, request peer review when practical. Use duo_send selectively; the peer has an independent persistent context.`;
+
+function cooperationPolicy(config: DuoConfig): string {
+  const workspacePolicy =
+    config.writePolicy === "austin-only"
+      ? `## Austin-only write policy
+Austin is the sole writer of project files. Tony must not call edit/write, run recognizable workspace-mutating shell commands, request workspace ownership, or ask Austin to transfer it. Tony should work as an independent reader, investigator, tester, and reviewer. Consolidate findings into concise reports with file:line evidence, failure conditions, and acceptance tests. Austin should implement changes and request Tony review at material checkpoints. Shared .pi-duo state and Tony's own session persistence are exempt from this project-file policy.`
+      : `## Transferable write policy
+Workspace ownership may move between Austin and Tony. A release or transfer wakes the peer in either direction; do not spend another peer message merely repeating that handoff.`;
+  return `${BASE_POLICY}\n\n${workspacePolicy}`;
+}
 
 const SendSchema = Type.Object({
   message: Type.String({
@@ -117,7 +128,14 @@ function stateModel(state: DuoState, actor: AgentId): ModelRef | undefined {
     : undefined;
 }
 
-function renderStatus(state: DuoState): string {
+async function enforceWritePolicy(
+  store: DuoStore,
+  config: DuoConfig,
+): Promise<DuoState | undefined> {
+  return store.enforceWritePolicy(config);
+}
+
+function renderStatus(state: DuoState, config: DuoConfig): string {
   const counts = { pending: 0, in_progress: 0, done: 0, blocked: 0 };
   for (const item of state.todo) counts[item.status]++;
   return [
@@ -126,6 +144,7 @@ function renderStatus(state: DuoState): string {
     `Todo: ${counts.done}/${state.todo.length} done, ${counts.in_progress} active, ${counts.blocked} blocked`,
     `Austin: ${modelText(stateModel(state, "austin"))} · session ${state.agents.austin.sessionId?.slice(0, 8) ?? "?"}`,
     `Tony: ${modelText(stateModel(state, "tony"))} · session ${state.agents.tony.sessionId?.slice(0, 8) ?? "?"}`,
+    `Write policy: ${config.writePolicy}`,
     `Workspace write owner: ${state.workspaceOwner ? agentName(state.workspaceOwner) : "none"}`,
     `Peer messages: ${state.peerMessageCount}`,
     `Last activity: ${state.lastActivityAt}`,
@@ -470,9 +489,11 @@ export default function piDuo(pi: ExtensionAPI) {
         "Read shared Duo status, goal, models, todo progress, and activity.",
       parameters: EmptySchema,
       execute: async () => {
-        const state = await store?.readState();
+        if (!store) return result("Duo has not been started");
+        const latestConfig = await store.readConfig();
+        const state = await enforceWritePolicy(store, latestConfig);
         return result(
-          state ? renderStatus(state) : "Duo has not been started",
+          state ? renderStatus(state, latestConfig) : "Duo has not been started",
           state,
         );
       },
@@ -596,14 +617,31 @@ export default function piDuo(pi: ExtensionAPI) {
       name: "duo_workspace",
       label: "Duo Workspace",
       description:
-        "Inspect, acquire, release, or transfer the shared workspace write lock. Read-only work never needs the lock.",
+        "Inspect project write ownership. In transferable mode, acquire, release, or transfer the shared write lock; read-only work never needs it.",
       parameters: WorkspaceSchema,
       execute: async (_id, params) => {
         if (!store) return result("Duo has not been started");
+        const latestConfig = await store.readConfig();
+        const currentState = await enforceWritePolicy(store, latestConfig);
         if (params.action === "status")
           return result(
-            `Workspace write owner: ${(await store.readState())?.workspaceOwner ?? "none"}`,
+            latestConfig.writePolicy === "austin-only"
+              ? "Workspace write owner: austin (fixed by writePolicy=austin-only)"
+              : `Workspace write owner: ${currentState?.workspaceOwner ?? "none"}`,
+            currentState,
           );
+        if (
+          !canUseWorkspaceAction(
+            latestConfig.writePolicy,
+            actor,
+            params.action,
+          )
+        ) {
+          return result(
+            "Workspace ownership is fixed to Austin by writePolicy=austin-only; no handoff was performed.",
+            currentState,
+          );
+        }
         const state = await store.update((draft) => {
           if (params.action === "acquire") {
             if (draft.workspaceOwner && draft.workspaceOwner !== actor)
@@ -667,11 +705,28 @@ export default function piDuo(pi: ExtensionAPI) {
         event.toolName === "write" ||
         (event.toolName === "bash" && isMutatingShell(shellCommand));
       if (!mutating || !store) return;
-      const state = await store.readState();
-      if (state?.workspaceOwner !== actor) {
+      const latestConfig = await store.readConfig();
+      const state = await enforceWritePolicy(store, latestConfig);
+      if (
+        !canMutateWorkspace(
+          latestConfig.writePolicy,
+          actor,
+          state?.workspaceOwner ?? null,
+        )
+      ) {
+        if (latestConfig.writePolicy === "austin-only") {
+          return {
+            block: true,
+            reason:
+              "Austin-only write policy: Tony may inspect, test, and review, but only Austin may modify project files. Send concise file:line findings or acceptance tests with duo_send.",
+          };
+        }
+        const owner = state?.workspaceOwner
+          ? agentName(state.workspaceOwner)
+          : "nobody";
         return {
           block: true,
-          reason: `Workspace write lock is owned by ${state?.workspaceOwner ? agentName(state.workspaceOwner) : "nobody"}. Use duo_workspace and coordinate a transfer.`,
+          reason: `Workspace write lock is owned by ${owner}. Use duo_workspace and coordinate a transfer.`,
         };
       }
     });
@@ -699,7 +754,7 @@ export default function piDuo(pi: ExtensionAPI) {
     const currentStore = getStore(cwd);
     store = currentStore;
     config = await currentStore.readConfig();
-    const state = await currentStore.readState();
+    const state = await enforceWritePolicy(currentStore, config);
     if (!state || state.status !== "active")
       throw new Error("No active Duo session. Use /duo start.");
     if (tony) return;
@@ -716,9 +771,10 @@ export default function piDuo(pi: ExtensionAPI) {
       registerTools(api, "tony");
       installWriteGuard(api, "tony");
       api.on("before_agent_start", async (event) => {
-        const latest = await currentStore.readState();
+        const latestConfig = await currentStore.readConfig();
+        const latest = await enforceWritePolicy(currentStore, latestConfig);
         return {
-          systemPrompt: `${event.systemPrompt}\n\nYou are Tony. Austin is your peer in the same workspace.\n\n${POLICY}\n\n${latest ? formatSharedContext(latest) : ""}`,
+          systemPrompt: `${event.systemPrompt}\n\nYou are Tony. Austin is your peer in the same workspace.\n\n${cooperationPolicy(latestConfig)}\n\n${latest ? formatSharedContext(latest) : ""}`,
         };
       });
     };
@@ -839,7 +895,7 @@ export default function piDuo(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     store = getStore(ctx.cwd);
     config = await store.readConfig();
-    const state = await store.readState();
+    const state = await enforceWritePolicy(store, config);
     if (
       state?.status === "active" &&
       state.agents.austin.sessionId === ctx.sessionManager.getSessionId()
@@ -856,10 +912,12 @@ export default function piDuo(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event) => {
-    const state = await store?.readState();
+    if (!store) return;
+    const latestConfig = await store.readConfig();
+    const state = await enforceWritePolicy(store, latestConfig);
     if (!state || state.status !== "active") return;
     return {
-      systemPrompt: `${event.systemPrompt}\n\nYou are Austin. Tony is your peer in the same workspace.\n\n${POLICY}\n\n${formatSharedContext(state)}`,
+      systemPrompt: `${event.systemPrompt}\n\nYou are Austin. Tony is your peer in the same workspace.\n\n${cooperationPolicy(latestConfig)}\n\n${formatSharedContext(state)}`,
     };
   });
 
@@ -867,8 +925,9 @@ export default function piDuo(pi: ExtensionAPI) {
     if (event.source === "extension" || event.text.trimStart().startsWith("/"))
       return;
     guard.beginUserTurn();
-    const state = await getStore(ctx.cwd).readState();
-    config = await getStore(ctx.cwd).readConfig();
+    const currentStore = getStore(ctx.cwd);
+    config = await currentStore.readConfig();
+    const state = await enforceWritePolicy(currentStore, config);
     if (state?.status === "active" && config.autoDispatch) {
       try {
         await ensureTony(ctx.cwd, ctx.modelRegistry);
@@ -968,13 +1027,13 @@ export default function piDuo(pi: ExtensionAPI) {
         );
         pi.sendMessage({
           customType: "pi-duo-peer",
-          content: renderStatus(state),
+          content: renderStatus(state, config),
           display: true,
         });
         return;
       }
 
-      const state = await currentStore.readState();
+      const state = await enforceWritePolicy(currentStore, config);
       if (!state)
         return void ctx.ui.notify("No Duo session. Use /duo start.", "warning");
 
@@ -1035,9 +1094,17 @@ export default function piDuo(pi: ExtensionAPI) {
             config.similarityThreshold = Number(value);
           else if (key === "autoDispatch")
             config.autoDispatch = value === "true";
-          else return void ctx.ui.notify(`Unknown config key: ${key}`, "error");
+          else if (key === "writePolicy") {
+            if (value !== "austin-only" && value !== "transferable")
+              return void ctx.ui.notify(
+                "writePolicy must be austin-only or transferable",
+                "error",
+              );
+            config.writePolicy = value;
+          } else return void ctx.ui.notify(`Unknown config key: ${key}`, "error");
         }
         await currentStore.writeConfig(config);
+        await enforceWritePolicy(currentStore, config);
         pi.sendMessage({
           customType: "pi-duo-peer",
           content: JSON.stringify(config, null, 2),
@@ -1046,7 +1113,7 @@ export default function piDuo(pi: ExtensionAPI) {
       } else if (command === "status" || command === "") {
         pi.sendMessage({
           customType: "pi-duo-peer",
-          content: renderStatus(state),
+          content: renderStatus(state, config),
           display: true,
         });
       } else {

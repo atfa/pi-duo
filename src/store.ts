@@ -22,6 +22,7 @@ export const DEFAULT_CONFIG: DuoConfig = {
   maxConsecutivePeerTurns: 3,
   similarityThreshold: 0.9,
   autoDispatch: true,
+  writePolicy: "austin-only",
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -62,7 +63,13 @@ export class DuoStore {
       const parsed = JSON.parse(
         await readFile(this.configPath, "utf8"),
       ) as Partial<DuoConfig>;
-      return { ...DEFAULT_CONFIG, ...parsed };
+      const config = { ...DEFAULT_CONFIG, ...parsed };
+      if (
+        config.writePolicy !== "austin-only" &&
+        config.writePolicy !== "transferable"
+      )
+        config.writePolicy = DEFAULT_CONFIG.writePolicy;
+      return config;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       return { ...DEFAULT_CONFIG };
@@ -83,6 +90,19 @@ export class DuoStore {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
     }
+  }
+
+  async enforceWritePolicy(config: DuoConfig): Promise<DuoState | undefined> {
+    const state = await this.readState();
+    if (
+      !state ||
+      config.writePolicy !== "austin-only" ||
+      state.workspaceOwner === "austin"
+    )
+      return state;
+    return this.update((draft) => {
+      draft.workspaceOwner = "austin";
+    });
   }
 
   async create(austin: ModelRef, tony: ModelRef): Promise<DuoState> {

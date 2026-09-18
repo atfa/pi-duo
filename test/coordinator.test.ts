@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  canMutateWorkspace,
+  canUseWorkspaceAction,
   controlPlaneDelivery,
   dispatchControlPlaneTask,
   LoopGuard,
@@ -56,6 +58,18 @@ test("control-plane tasks dispatch without waiting for the peer turn", async () 
     },
   );
   assert.equal(synchronousCaught, synchronous);
+});
+
+test("Austin-only policy fixes project writes to Austin", () => {
+  assert.equal(canMutateWorkspace("austin-only", "austin", null), true);
+  assert.equal(canMutateWorkspace("austin-only", "tony", "tony"), false);
+  assert.equal(canMutateWorkspace("transferable", "tony", "tony"), true);
+  assert.equal(canMutateWorkspace("transferable", "tony", "austin"), false);
+  assert.equal(canUseWorkspaceAction("austin-only", "austin", "status"), true);
+  assert.equal(canUseWorkspaceAction("austin-only", "austin", "acquire"), true);
+  assert.equal(canUseWorkspaceAction("austin-only", "austin", "transfer"), false);
+  assert.equal(canUseWorkspaceAction("austin-only", "tony", "acquire"), false);
+  assert.equal(canUseWorkspaceAction("transferable", "tony", "transfer"), true);
 });
 
 test("workspace handoffs route symmetrically through the control plane", () => {

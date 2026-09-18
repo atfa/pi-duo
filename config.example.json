@@ -10,5 +10,6 @@
   "maxPeerMessagesPerTurn": 6,
   "maxConsecutivePeerTurns": 3,
   "similarityThreshold": 0.9,
-  "autoDispatch": true
+  "autoDispatch": true,
+  "writePolicy": "austin-only"
 }

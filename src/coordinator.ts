@@ -1,4 +1,4 @@
-import type { AgentId, DuoConfig } from "./types.js";
+import type { AgentId, DuoConfig, WritePolicy } from "./types.js";
 import { DuoStore, textSimilarity } from "./store.js";
 
 export type TriggerDelivery =
@@ -34,6 +34,27 @@ export function controlPlaneDelivery(
   return isStreaming
     ? { triggerTurn: true, deliverAs: "steer" }
     : { triggerTurn: true };
+}
+
+export type WorkspaceAction = "status" | "acquire" | "release" | "transfer";
+
+export function canMutateWorkspace(
+  policy: WritePolicy,
+  actor: AgentId,
+  workspaceOwner: AgentId | null,
+): boolean {
+  return policy === "austin-only"
+    ? actor === "austin"
+    : workspaceOwner === actor;
+}
+
+export function canUseWorkspaceAction(
+  policy: WritePolicy,
+  actor: AgentId,
+  action: WorkspaceAction,
+): boolean {
+  if (policy === "transferable" || action === "status") return true;
+  return actor === "austin" && action === "acquire";
 }
 
 export function workspaceHandoffRecipient(

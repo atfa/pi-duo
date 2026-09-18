@@ -1,5 +1,6 @@
 export type AgentId = "austin" | "tony";
 export type TodoStatus = "pending" | "in_progress" | "done" | "blocked";
+export type WritePolicy = "austin-only" | "transferable";
 
 export interface ModelRef {
   provider: string;
@@ -13,6 +14,7 @@ export interface DuoConfig {
   maxConsecutivePeerTurns: number;
   similarityThreshold: number;
   autoDispatch: boolean;
+  writePolicy: WritePolicy;
 }
 
 export interface TodoItem {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -37,11 +37,46 @@ test("persists config defaults and overrides", async () => {
     await store.writeConfig({
       ...DEFAULT_CONFIG,
       autoDispatch: false,
+      writePolicy: "transferable",
       agentB: { provider: "x", modelId: "y" },
     });
     const config = await store.readConfig();
     assert.equal(config.autoDispatch, false);
+    assert.equal(config.writePolicy, "transferable");
     assert.deepEqual(config.agentB, { provider: "x", modelId: "y" });
+
+    await writeFile(store.configPath, '{"autoDispatch":false}\n');
+    assert.equal((await store.readConfig()).writePolicy, "austin-only");
+    await writeFile(store.configPath, '{"writePolicy":"invalid"}\n');
+    assert.equal((await store.readConfig()).writePolicy, "austin-only");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("Austin-only policy normalizes stale workspace ownership", async () => {
+  const { cwd, store } = await fixture();
+  try {
+    await store.update((state) => {
+      state.workspaceOwner = "tony";
+    });
+    const normalized = await store.enforceWritePolicy({
+      ...DEFAULT_CONFIG,
+      writePolicy: "austin-only",
+    });
+    assert.equal(normalized?.workspaceOwner, "austin");
+    const revision = normalized?.revision;
+    const unchanged = await store.enforceWritePolicy(DEFAULT_CONFIG);
+    assert.equal(unchanged?.revision, revision);
+
+    await store.update((state) => {
+      state.workspaceOwner = "tony";
+    });
+    const transferable = await store.enforceWritePolicy({
+      ...DEFAULT_CONFIG,
+      writePolicy: "transferable",
+    });
+    assert.equal(transferable?.workspaceOwner, "tony");
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
