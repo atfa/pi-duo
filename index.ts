@@ -16,6 +16,7 @@ import {
   controlPlaneDelivery,
   dispatchControlPlaneTask,
   LoopGuard,
+  roleDescription,
   triggeringDelivery,
   workspaceHandoffRecipient,
 } from "./src/coordinator.js";
@@ -42,14 +43,22 @@ Share important discoveries, evidence, and decisions. Avoid acknowledgements wit
 Never run sleep commands or poll while waiting for the peer. Send your current work with duo_send and end the turn; a later peer message will trigger another turn.
 For consequential architecture changes, request peer review when practical. Use duo_send selectively; the peer has an independent persistent context.`;
 
-function cooperationPolicy(config: DuoConfig): string {
+function cooperationPolicy(config: DuoConfig, actor: AgentId): string {
+  const identityPolicy =
+    actor === "austin"
+      ? `## Fixed role identity
+You are Austin, the foreground agent. Tony is the background peer. Never identify yourself as Tony or spend a peer message asking the peer to confirm identities.
+Before your final user-facing answer, reconcile the shared duo_todo list: mark completed work done and leave genuinely unfinished work pending or blocked.`
+      : `## Fixed role identity
+You are Tony, the background peer. Austin is the foreground agent. Never identify yourself as Austin or spend a peer message asking the peer to confirm identities.
+Consolidate review findings instead of narrating every intermediate check. If shared todos are stale, tell Austin which items need reconciliation.`;
   const workspacePolicy =
     config.writePolicy === "austin-only"
       ? `## Austin-only write policy
 Austin is the sole writer of project files. Tony must not call edit/write, run recognizable workspace-mutating shell commands, request workspace ownership, or ask Austin to transfer it. Tony should work as an independent reader, investigator, tester, and reviewer. Consolidate findings into concise reports with file:line evidence, failure conditions, and acceptance tests. Austin should implement changes and request Tony review at material checkpoints. Shared .pi-duo state and Tony's own session persistence are exempt from this project-file policy.`
       : `## Transferable write policy
 Workspace ownership may move between Austin and Tony. A release or transfer wakes the peer in either direction; do not spend another peer message merely repeating that handoff.`;
-  return `${BASE_POLICY}\n\n${workspacePolicy}`;
+  return `${BASE_POLICY}\n\n${identityPolicy}\n\n${workspacePolicy}`;
 }
 
 const SendSchema = Type.Object({
@@ -135,11 +144,16 @@ async function enforceWritePolicy(
   return store.enforceWritePolicy(config);
 }
 
-function renderStatus(state: DuoState, config: DuoConfig): string {
+function renderStatus(
+  state: DuoState,
+  config: DuoConfig,
+  actor: AgentId,
+): string {
   const counts = { pending: 0, in_progress: 0, done: 0, blocked: 0 };
   for (const item of state.todo) counts[item.status]++;
   return [
     `Duo: ${state.status} (revision ${state.revision})`,
+    `Current role: ${roleDescription(actor)}`,
     `Goal: ${state.goal || "(not set)"}`,
     `Todo: ${counts.done}/${state.todo.length} done, ${counts.in_progress} active, ${counts.blocked} blocked`,
     `Austin: ${modelText(stateModel(state, "austin"))} · session ${state.agents.austin.sessionId?.slice(0, 8) ?? "?"}`,
@@ -493,7 +507,9 @@ export default function piDuo(pi: ExtensionAPI) {
         const latestConfig = await store.readConfig();
         const state = await enforceWritePolicy(store, latestConfig);
         return result(
-          state ? renderStatus(state, latestConfig) : "Duo has not been started",
+          state
+            ? renderStatus(state, latestConfig, actor)
+            : "Duo has not been started",
           state,
         );
       },
@@ -774,7 +790,7 @@ export default function piDuo(pi: ExtensionAPI) {
         const latestConfig = await currentStore.readConfig();
         const latest = await enforceWritePolicy(currentStore, latestConfig);
         return {
-          systemPrompt: `${event.systemPrompt}\n\nYou are Tony. Austin is your peer in the same workspace.\n\n${cooperationPolicy(latestConfig)}\n\n${latest ? formatSharedContext(latest) : ""}`,
+          systemPrompt: `${event.systemPrompt}\n\nYou are Tony. Austin is your peer in the same workspace.\n\n${cooperationPolicy(latestConfig, "tony")}\n\n${latest ? formatSharedContext(latest) : ""}`,
         };
       });
     };
@@ -846,7 +862,7 @@ export default function piDuo(pi: ExtensionAPI) {
         await activeTony.sendCustomMessage(
           {
             customType: "pi-duo-user-task",
-            content: `[Shared user task]\n${prompt}`,
+            content: `[Shared user task for ${roleDescription("tony")}]\nAustin is the foreground agent and owns project-file edits in austin-only mode. Independently inspect, test, and review; send concise evidence instead of implementing files.\n\n${prompt}`,
             display: false,
           },
           triggeringDelivery(activeTony.isStreaming),
@@ -917,7 +933,7 @@ export default function piDuo(pi: ExtensionAPI) {
     const state = await enforceWritePolicy(store, latestConfig);
     if (!state || state.status !== "active") return;
     return {
-      systemPrompt: `${event.systemPrompt}\n\nYou are Austin. Tony is your peer in the same workspace.\n\n${cooperationPolicy(latestConfig)}\n\n${formatSharedContext(state)}`,
+      systemPrompt: `${event.systemPrompt}\n\nYou are Austin. Tony is your peer in the same workspace.\n\n${cooperationPolicy(latestConfig, "austin")}\n\n${formatSharedContext(state)}`,
     };
   });
 
@@ -1027,7 +1043,7 @@ export default function piDuo(pi: ExtensionAPI) {
         );
         pi.sendMessage({
           customType: "pi-duo-peer",
-          content: renderStatus(state, config),
+          content: renderStatus(state, config, "austin"),
           display: true,
         });
         return;
@@ -1088,6 +1104,8 @@ export default function piDuo(pi: ExtensionAPI) {
           const [key, value] = update.split("=");
           if (key === "maxPeerMessagesPerTurn")
             config.maxPeerMessagesPerTurn = Number(value);
+          else if (key === "maxDeferredMessagesPerTurn")
+            config.maxDeferredMessagesPerTurn = Number(value);
           else if (key === "maxConsecutivePeerTurns")
             config.maxConsecutivePeerTurns = Number(value);
           else if (key === "similarityThreshold")
@@ -1113,7 +1131,7 @@ export default function piDuo(pi: ExtensionAPI) {
       } else if (command === "status" || command === "") {
         pi.sendMessage({
           customType: "pi-duo-peer",
-          content: renderStatus(state, config),
+          content: renderStatus(state, config, "austin"),
           display: true,
         });
       } else {

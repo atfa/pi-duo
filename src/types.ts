@@ -11,6 +11,7 @@ export interface DuoConfig {
   agentA?: ModelRef;
   agentB?: ModelRef;
   maxPeerMessagesPerTurn: number;
+  maxDeferredMessagesPerTurn: number;
   maxConsecutivePeerTurns: number;
   similarityThreshold: number;
   autoDispatch: boolean;

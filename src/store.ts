@@ -19,6 +19,7 @@ import type {
 
 export const DEFAULT_CONFIG: DuoConfig = {
   maxPeerMessagesPerTurn: 6,
+  maxDeferredMessagesPerTurn: 2,
   maxConsecutivePeerTurns: 3,
   similarityThreshold: 0.9,
   autoDispatch: true,
@@ -301,11 +302,75 @@ export function isWaitingShell(command: string): boolean {
   );
 }
 
+function maskQuotedShellText(command: string): string {
+  const characters = command.split("");
+  let quote: "'" | '"' | undefined;
+  for (let index = 0; index < characters.length; index++) {
+    const character = characters[index];
+    if (quote) {
+      characters[index] = character === "\n" ? "\n" : " ";
+      if (character === "\\" && quote === '"' && index + 1 < characters.length) {
+        index++;
+        if (characters[index] !== "\n") characters[index] = " ";
+      } else if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === "\\" && index + 1 < characters.length) {
+      characters[index] = " ";
+      index++;
+      if (characters[index] !== "\n") characters[index] = " ";
+    } else if (character === "'" || character === '"') {
+      quote = character;
+      characters[index] = " ";
+    }
+  }
+  return characters.join("");
+}
+
+function maskHereDocumentBodies(command: string): string {
+  const lines = command.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
+  let delimiter: string | undefined;
+  let stripTabs = false;
+  return lines
+    .map((line) => {
+      const content = line.endsWith("\n") ? line.slice(0, -1) : line;
+      if (delimiter) {
+        const candidate = stripTabs ? content.replace(/^\t+/u, "") : content;
+        if (candidate.trimEnd() === delimiter) delimiter = undefined;
+        return `${" ".repeat(content.length)}${line.endsWith("\n") ? "\n" : ""}`;
+      }
+      const visible = maskQuotedShellText(line);
+      const heredoc = /<<(-)?\s*(?!<)(?:'([^']+)'|"([^"]+)"|([A-Za-z_][\w]*))/gu;
+      for (const match of line.matchAll(heredoc)) {
+        if (visible.slice(match.index, match.index + 2) !== "<<") continue;
+        stripTabs = match[1] === "-";
+        delimiter = match[2] ?? match[3] ?? match[4];
+        break;
+      }
+      return line;
+    })
+    .join("");
+}
+
+function quotedShellScripts(command: string): string[] {
+  const visible = maskQuotedShellText(command);
+  const scripts: string[] = [];
+  for (const match of command.matchAll(
+    /\b(?:bash|zsh|ksh|sh)\s+-c\s+(['"])([\s\S]*?)\1/giu,
+  )) {
+    if (visible[match.index] !== " ") scripts.push(match[2] ?? "");
+  }
+  return scripts;
+}
+
 export function isMutatingShell(command: string): boolean {
-  const withoutNonFileRedirects = command
+  if (quotedShellScripts(command).some((script) => isMutatingShell(script)))
+    return true;
+  const visible = maskQuotedShellText(maskHereDocumentBodies(command));
+  const withoutNonFileRedirects = visible
     .replace(/\d*>>?\s*\/dev\/null\b/gu, "")
     .replace(/\d*>\s*&\d+\b/gu, "");
-  return /(^|[;&|]\s*|\b)(rm|mv|cp|mkdir|rmdir|touch|chmod|chown|git\s+(add|commit|checkout|switch|reset|clean|merge|rebase|apply)|npm\s+(install|uninstall)|pnpm\s+(add|remove|install)|yarn\s+(add|remove|install)|tee|truncate)\b|(^|[^<])>>?|\bsed\s+-i\b/iu.test(
+  return /(^|[;&|]\s*|\b)(rm|mv|cp|mkdir|rmdir|touch|chmod|chown|git\s+(add|commit|checkout|switch|reset|clean|merge|rebase|apply)|npm\s+(install|uninstall)|pnpm\s+(add|remove|install)|yarn\s+(add|remove|install)|tee|truncate)\b|(^|[^<=>])>>?(?!=)|\bsed\s+-i\b/iu.test(
     withoutNonFileRedirects,
   );
 }

@@ -38,6 +38,12 @@ export function controlPlaneDelivery(
 
 export type WorkspaceAction = "status" | "acquire" | "release" | "transfer";
 
+export function roleDescription(actor: AgentId): string {
+  return actor === "austin"
+    ? "Austin (foreground agent; not Tony)"
+    : "Tony (background peer; not Austin)";
+}
+
 export function canMutateWorkspace(
   policy: WritePolicy,
   actor: AgentId,
@@ -116,11 +122,13 @@ export class LoopGuard {
         persistWithoutTurn: false,
       };
     if (this.sentThisTurn >= config.maxPeerMessagesPerTurn) {
-      const mayPersist = importance !== "normal" && this.deferredThisTurn === 0;
+      const mayPersist =
+        importance !== "normal" &&
+        this.deferredThisTurn < config.maxDeferredMessagesPerTurn;
       return {
         reason: mayPersist
           ? `Peer-message budget exhausted (${config.maxPeerMessagesPerTurn} this user turn).`
-          : `Peer-message budget exhausted (${config.maxPeerMessagesPerTurn} this user turn); the context-only overflow slot is unavailable. Continue independently or wait for the user.`,
+          : `Peer-message budget exhausted (${config.maxPeerMessagesPerTurn} this user turn); all ${config.maxDeferredMessagesPerTurn} context-only overflow slots are used until the next user input. Continue independently and do not retry this message.`,
         persistWithoutTurn: mayPersist,
       };
     }

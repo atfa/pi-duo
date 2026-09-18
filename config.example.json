@@ -8,6 +8,7 @@
     "modelId": "your-tony-model"
   },
   "maxPeerMessagesPerTurn": 6,
+  "maxDeferredMessagesPerTurn": 2,
   "maxConsecutivePeerTurns": 3,
   "similarityThreshold": 0.9,
   "autoDispatch": true,

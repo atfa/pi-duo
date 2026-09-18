@@ -54,7 +54,7 @@ The selected models are saved to `<project>/.pi-duo/config.json`. You may instea
 /duo stop             # preserve both histories
 /duo resume           # reopen Austin's and Tony's saved Pi sessions
 /duo config writePolicy=austin-only
-/duo config autoDispatch=false maxPeerMessagesPerTurn=4
+/duo config autoDispatch=false maxPeerMessagesPerTurn=4 maxDeferredMessagesPerTurn=2
 ```
 
 Agent tools:
@@ -82,7 +82,7 @@ State changes use a revision, a cross-process lock directory, atomic file replac
 
 ## Runtime behavior
 
-With `autoDispatch: true`, each normal user task is also delivered to Tony. Austin and Tony can investigate concurrently and communicate only when useful; neither is assigned a fixed planner/reviewer role. Important Tony messages appear in the main UI as `[Tony]` entries.
+With `autoDispatch: true`, each normal user task is also delivered to Tony with an explicit role reminder. Austin and Tony can investigate concurrently and communicate only when useful. Under the default `austin-only` policy, Austin implements while Tony acts as the background investigator and reviewer. Important Tony messages appear in the main UI as `[Tony]` entries.
 
 Loop protection includes:
 
@@ -90,7 +90,7 @@ Loop protection includes:
 - maximum consecutive peer-only messages without material tool activity
 - similarity suppression against recent messages
 
-When the per-turn total is exhausted, the first additional `important` or `decision` message is still written to the peer's persistent context and `messages.jsonl`, but it does not trigger another model turn. Further overflow and normal-priority overflow are rejected. This preserves one late critical finding without allowing an unbounded peer loop.
+When the per-turn total is exhausted, up to `maxDeferredMessagesPerTurn` additional `important` or `decision` messages are still written to the peer's persistent context and `messages.jsonl`, but they do not trigger another model turn. Normal-priority overflow and further high-priority overflow are rejected until the next user input. Duplicate suppression still applies, so retrying the same deferred report does not consume another slot. The default of two slots preserves a late implementation checkpoint and a later critical correction without allowing an unbounded peer loop.
 
 The default `writePolicy` is `austin-only`: Austin is the sole project-file writer, while Tony reads, investigates, tests, challenges assumptions, and sends consolidated file-and-line findings for Austin to implement. `duo_workspace` cannot release or transfer ownership in this mode, and stale project state is normalized back to Austin. Shared `.pi-duo` state and Tony's own session files remain writable because they are extension metadata, not project edits.
 

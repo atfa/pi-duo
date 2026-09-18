@@ -9,6 +9,7 @@ import {
   controlPlaneDelivery,
   dispatchControlPlaneTask,
   LoopGuard,
+  roleDescription,
   triggeringDelivery,
   workspaceHandoffRecipient,
 } from "../src/coordinator.js";
@@ -58,6 +59,11 @@ test("control-plane tasks dispatch without waiting for the peer turn", async () 
     },
   );
   assert.equal(synchronousCaught, synchronous);
+});
+
+test("role descriptions make the current identity unambiguous", () => {
+  assert.equal(roleDescription("austin"), "Austin (foreground agent; not Tony)");
+  assert.equal(roleDescription("tony"), "Tony (background peer; not Austin)");
 });
 
 test("Austin-only policy fixes project writes to Austin", () => {
@@ -179,16 +185,43 @@ test("loop guard enforces duplicate, total, and consecutive limits", async () =>
     );
     assert.match(deferredImportant?.reason ?? "", /budget exhausted/);
     assert.equal(deferredImportant?.persistWithoutTurn, true);
+    await store.appendMessage({
+      from: "tony",
+      to: "austin",
+      content: "late critical finding",
+      importance: "important",
+      deferred: true,
+      userTurn: guard.turn,
+    });
     guard.recordDeferredMessage();
-    const blockedSecondOverflow = await guard.check(
+    const duplicateDeferred = await guard.check(
+      store,
+      "tony",
+      "late critical finding",
+      config,
+      "important",
+    );
+    assert.equal(duplicateDeferred?.persistWithoutTurn, false);
+    assert.match(duplicateDeferred?.reason ?? "", /similar/);
+    const secondDeferred = await guard.check(
       store,
       "austin",
       "another late critical finding",
       config,
       "decision",
     );
-    assert.equal(blockedSecondOverflow?.persistWithoutTurn, false);
-    assert.match(blockedSecondOverflow?.reason ?? "", /slot is unavailable/);
+    assert.equal(secondDeferred?.persistWithoutTurn, true);
+    guard.recordDeferredMessage();
+    const blockedThirdOverflow = await guard.check(
+      store,
+      "tony",
+      "third late critical finding",
+      config,
+      "important",
+    );
+    assert.equal(blockedThirdOverflow?.persistWithoutTurn, false);
+    assert.match(blockedThirdOverflow?.reason ?? "", /all 2.*slots are used/);
+    assert.match(blockedThirdOverflow?.reason ?? "", /do not retry/);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

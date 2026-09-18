@@ -46,7 +46,9 @@ test("persists config defaults and overrides", async () => {
     assert.deepEqual(config.agentB, { provider: "x", modelId: "y" });
 
     await writeFile(store.configPath, '{"autoDispatch":false}\n');
-    assert.equal((await store.readConfig()).writePolicy, "austin-only");
+    const migrated = await store.readConfig();
+    assert.equal(migrated.writePolicy, "austin-only");
+    assert.equal(migrated.maxDeferredMessagesPerTurn, 2);
     await writeFile(store.configPath, '{"writePolicy":"invalid"}\n');
     assert.equal((await store.readConfig()).writePolicy, "austin-only");
   } finally {
@@ -178,6 +180,21 @@ test("similarity and shell mutation checks are conservative", () => {
   assert.equal(isMutatingShell("rg parser src"), false);
   assert.equal(isMutatingShell("rm -rf build"), true);
   assert.equal(isMutatingShell("printf x > file"), true);
+  assert.equal(isMutatingShell('printf "%s\\n" ">"'), false);
+  assert.equal(
+    isMutatingShell(
+      "node -e 'const xs = [1]; console.log(xs.filter((x) => x > 0))'",
+    ),
+    false,
+  );
+  assert.equal(isMutatingShell("grep -o '<div[^>]*>' index.html"), false);
+  assert.equal(isMutatingShell("sed 's/<redacted>/safe/g' config.txt"), false);
+  assert.equal(
+    isMutatingShell("node - <<'NODE'\nif (value > 1) console.log(value);\nNODE"),
+    false,
+  );
+  assert.equal(isMutatingShell("bash -c 'printf x > file'"), true);
+  assert.equal(isMutatingShell(`printf "%s\\n" "bash -c 'rm file'"`), false);
   assert.equal(isMutatingShell("git status"), false);
   assert.equal(
     isMutatingShell('find . -name "*.json" 2>/dev/null | head'),
