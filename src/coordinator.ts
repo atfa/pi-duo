@@ -16,6 +16,17 @@ export function triggeringDelivery(isStreaming: boolean): TriggerDelivery {
     : { triggerTurn: true };
 }
 
+export function dispatchControlPlaneTask(
+  task: () => Promise<void>,
+  onError: (error: unknown) => void,
+): void {
+  try {
+    void task().catch(onError);
+  } catch (error) {
+    onError(error);
+  }
+}
+
 /** Control-plane handoffs must wake an idle peer and interrupt a streaming peer. */
 export function controlPlaneDelivery(
   isStreaming: boolean,

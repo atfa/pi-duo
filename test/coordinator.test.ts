@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   controlPlaneDelivery,
+  dispatchControlPlaneTask,
   LoopGuard,
   triggeringDelivery,
   workspaceHandoffRecipient,
@@ -19,11 +20,46 @@ test("idle delivery triggers immediately instead of being parked for a later tur
   });
 });
 
-test("workspace handoffs route symmetrically through the control plane", () => {
-  assert.equal(
-    workspaceHandoffRecipient("austin", "transfer", "tony"),
-    "tony",
+test("control-plane tasks dispatch without waiting for the peer turn", async () => {
+  let finishTask: (() => void) | undefined;
+  let completed = false;
+  const pending = new Promise<void>((resolve) => {
+    finishTask = resolve;
+  });
+  dispatchControlPlaneTask(
+    async () => {
+      await pending;
+      completed = true;
+    },
+    (error) => assert.fail(error instanceof Error ? error : String(error)),
   );
+  assert.equal(completed, false);
+  finishTask?.();
+  await pending;
+  await Promise.resolve();
+  assert.equal(completed, true);
+
+  const expected = new Error("handoff failed");
+  const caught = new Promise<unknown>((resolve) => {
+    dispatchControlPlaneTask(() => Promise.reject(expected), resolve);
+  });
+  assert.equal(await caught, expected);
+
+  const synchronous = new Error("synchronous handoff failure");
+  let synchronousCaught: unknown;
+  dispatchControlPlaneTask(
+    () => {
+      throw synchronous;
+    },
+    (error) => {
+      synchronousCaught = error;
+    },
+  );
+  assert.equal(synchronousCaught, synchronous);
+});
+
+test("workspace handoffs route symmetrically through the control plane", () => {
+  assert.equal(workspaceHandoffRecipient("austin", "transfer", "tony"), "tony");
   assert.equal(
     workspaceHandoffRecipient("tony", "transfer", "austin"),
     "austin",

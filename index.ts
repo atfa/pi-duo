@@ -12,6 +12,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   controlPlaneDelivery,
+  dispatchControlPlaneTask,
   LoopGuard,
   triggeringDelivery,
   workspaceHandoffRecipient,
@@ -399,16 +400,49 @@ export default function piDuo(pi: ExtensionAPI) {
     }
     const activeTony = tony;
     if (!activeTony) return false;
-    await activeTony.sendCustomMessage(
-      {
-        customType: "pi-duo-peer",
-        content,
-        display: false,
-        details: message,
+    const wasStreaming = activeTony.isStreaming;
+    dispatchControlPlaneTask(
+      async () => {
+        await activeTony.sendCustomMessage(
+          {
+            customType: "pi-duo-peer",
+            content,
+            display: false,
+            details: message,
+          },
+          controlPlaneDelivery(wasStreaming),
+        );
+        if (
+          wasStreaming ||
+          !isCurrentGeneration(generation) ||
+          tony !== activeTony
+        )
+          return;
+        const error = latestAssistantOutcome(activeTony)?.error;
+        if (!error) return;
+        sendMessageSafely(
+          {
+            customType: "pi-duo-peer",
+            content: `[Tony error]\n${error}`,
+            display: true,
+          },
+          { triggerTurn: false },
+          generation,
+        );
       },
-      controlPlaneDelivery(activeTony.isStreaming),
+      (error) => {
+        sendMessageSafely(
+          {
+            customType: "pi-duo-peer",
+            content: `[Tony handoff error]\n${error instanceof Error ? error.message : String(error)}`,
+            display: true,
+          },
+          { triggerTurn: false },
+          generation,
+        );
+      },
     );
-    return isCurrentGeneration(generation) && tony === activeTony;
+    return true;
   };
 
   const registerTools = (api: ExtensionAPI, actor: AgentId) => {
@@ -588,7 +622,6 @@ export default function piDuo(pi: ExtensionAPI) {
             draft.workspaceOwner = params.to;
           }
         });
-        let resultState = state;
         let handoffStatus = "";
         if (params.action === "release" || params.action === "transfer") {
           const recipient = workspaceHandoffRecipient(
@@ -597,21 +630,20 @@ export default function piDuo(pi: ExtensionAPI) {
             state.workspaceOwner,
           );
           if (recipient) {
-            const delivered = await notifyPeerOfWorkspaceHandoff(
+            const dispatched = await notifyPeerOfWorkspaceHandoff(
               actor,
               recipient,
               state,
               params.action,
             );
-            handoffStatus = delivered
-              ? ` ${agentName(recipient)} was awakened through the workspace control plane.`
-              : ` ${agentName(recipient)} could not be awakened; resume Duo before relying on the handoff.`;
-            resultState = (await store.readState()) ?? state;
+            handoffStatus = dispatched
+              ? ` ${agentName(recipient)} wake-up was dispatched through the workspace control plane; this does not wait for the peer's full turn.`
+              : ` ${agentName(recipient)} could not be notified; resume Duo before relying on the handoff.`;
           }
         }
         return result(
-          `Workspace write owner: ${resultState.workspaceOwner ?? "none"}.${handoffStatus}`,
-          resultState,
+          `Workspace ownership committed at revision ${state.revision}: ${state.workspaceOwner ?? "none"}.${handoffStatus}`,
+          state,
         );
       },
     });
