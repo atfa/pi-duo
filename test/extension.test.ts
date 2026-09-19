@@ -181,6 +181,7 @@ test("duo_plan and duo_checkpoint enforce strict phase transitions", async () =>
       draft.collaboration!.phase = "converge";
       draft.collaboration!.tonyContributed = true;
       draft.collaboration!.tonyInitialContribution = true;
+      draft.collaboration!.tonyRespondedToAustin = true;
     });
 
     // 4. Plan commit succeeds in CONVERGE -> EXECUTE
@@ -575,6 +576,59 @@ test("Execution Gate constrains transferable Tony owner but preserves Tony scrat
   }
 });
 
+test("only Tony's second message completes the collaboration handshake", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-handshake-test-"));
+  try {
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+    await store.writeConfig({ ...(await store.readConfig()), autoDispatch: false });
+    await store.update((draft) => { draft.agents.austin.sessionId = "mock-session-id"; });
+    const tools = new Map<string, (id: string, params: any) => Promise<any>>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const api = {
+      registerTool(tool: { name: string; execute: any }) { tools.set(tool.name, tool.execute); },
+      registerCommand() {}, registerMessageRenderer() {}, sendMessage() {},
+      on(name: string, handler: any) {
+        if (!events.has(name)) events.set(name, []);
+        events.get(name)!.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+    piDuo(api);
+    for (const handler of events.get("session_start") || []) {
+      await handler({}, { cwd, sessionManager: { getSessionId: () => "mock-session-id" }, modelRegistry: { find: () => undefined }, ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} } });
+    }
+    for (const handler of events.get("input") || []) {
+      await handler({ text: "negotiate", source: "user" }, { cwd, modelRegistry: { find: () => undefined }, ui: { notify: () => {} } });
+    }
+    const tonyTools = new Map<string, (id: string, params: any) => Promise<any>>();
+    (api as any).__registerTonyTools({ registerTool(tool: { name: string; execute: any }) { tonyTools.set(tool.name, tool.execute); }, on() {} }, 1, { isStreaming: false, waitForIdle: async () => {}, sendCustomMessage: async () => {}, messages: [] });
+    const austinSend = tools.get("duo_send");
+    const tonySend = tonyTools.get("duo_send");
+    const plan = tools.get("duo_plan");
+    assert.ok(austinSend); assert.ok(tonySend); assert.ok(plan);
+
+    await austinSend("1", { message: "Austin's first proposal", kind: "proposal" });
+    await tonySend("2", { message: "Tony's initial proposal", kind: "proposal" });
+    let state = await store.readState();
+    assert.equal(state?.collaboration?.tonyInitialContribution, true);
+    assert.notEqual(state?.collaboration?.tonyRespondedToAustin, true);
+    assert.equal(state?.collaboration?.phase, "explore");
+    const earlyCommit = await plan("3", { action: "commit", plan: "too early" });
+    assert.match(earlyCommit.content[0].text, /requires CONVERGE phase/i);
+
+    await austinSend("4", { message: "Austin's counterproposal", kind: "proposal" });
+    await tonySend("5", { message: "Tony's response to Austin", kind: "proposal" });
+    state = await store.readState();
+    assert.equal(state?.collaboration?.tonyRespondedToAustin, true);
+    assert.equal(state?.collaboration?.phase, "converge");
+    const commit = await plan("6", { action: "commit", plan: "agreed" });
+    assert.match(commit.content[0].text, /Phase: EXECUTE/i);
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
 test("EXPLORE collaboration indicator does not use review wording", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-collaboration-indicator-test-"));
   try {
@@ -761,6 +815,7 @@ test("Tony reviewFinding returns collaboration to EXECUTE, clears review, and al
       draft.collaboration!.tonyContributed = true;
       draft.collaboration!.tonyInitialContribution = true;
       draft.collaboration!.austinContributed = true;
+      draft.collaboration!.tonyRespondedToAustin = true;
       draft.collaboration!.phase = "execute";
     });
 

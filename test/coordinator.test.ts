@@ -491,7 +491,7 @@ test("collaborationReadyToConverge requires bilateral contributions in normal mo
     }),
     false,
   );
-  // Both contributed and tonyInitialContribution is true
+  // A bilateral exchange alone does not prove Tony answered Austin.
   assert.equal(
     collaborationReadyToConverge({
       userTurn: 1,
@@ -499,6 +499,19 @@ test("collaborationReadyToConverge requires bilateral contributions in normal mo
       austinContributed: true,
       tonyContributed: true,
       tonyInitialContribution: true,
+      contested: false,
+      planRevision: 0,
+    }),
+    false,
+  );
+  assert.equal(
+    collaborationReadyToConverge({
+      userTurn: 1,
+      phase: "explore",
+      austinContributed: true,
+      tonyContributed: true,
+      tonyInitialContribution: true,
+      tonyRespondedToAustin: true,
       contested: false,
       planRevision: 0,
     }),
@@ -513,6 +526,7 @@ test("validatePlanCommit enforces actor, phase, and contribution guards", () => 
     austinContributed: true,
     tonyContributed: true,
     tonyInitialContribution: true,
+    tonyRespondedToAustin: true,
     contested: false,
     planRevision: 1,
   };
@@ -550,7 +564,7 @@ test("validatePlanCommit enforces actor, phase, and contribution guards", () => 
   // Tony hasn't contributed
   assert.match(
     validatePlanCommit("austin", { ...baseCollab, tonyContributed: false }) ?? "",
-    /Tony has not provided the required independent contribution/i,
+    /Tony has not responded to Austin/i,
   );
 
   // Valid commit in CONVERGE
@@ -753,6 +767,20 @@ test("tonyShouldYieldAfterSend only yields on successful delivery or deferred pe
       "No pending Tony review exists. Send ordinary coordination with reviewComplete omitted.",
     ),
     false,
+  );
+  // Tony's response to Austin completes the T → A → T negotiation.
+  assert.equal(
+    collaborationReadyToConverge({
+      userTurn: 1,
+      phase: "explore",
+      austinContributed: true,
+      tonyContributed: true,
+      tonyInitialContribution: true,
+      tonyRespondedToAustin: true,
+      contested: false,
+      planRevision: 0,
+    }),
+    true,
   );
 });
 
@@ -1021,5 +1049,3 @@ test("degradeCollaborationTurn protects against stale userTurn pollution", async
     await rm(cwd, { recursive: true, force: true });
   }
 });
-
-

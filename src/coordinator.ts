@@ -163,7 +163,8 @@ export function collaborationReadyToConverge(
   return (
     collaboration.austinContributed &&
     collaboration.tonyContributed &&
-    collaboration.tonyInitialContribution
+    collaboration.tonyInitialContribution &&
+    collaboration.tonyRespondedToAustin === true
   );
 }
 
@@ -193,9 +194,10 @@ export function validatePlanCommit(
   }
   if (
     !collaboration.tonyContributed ||
-    !collaboration.tonyInitialContribution
+    !collaboration.tonyInitialContribution ||
+    !collaboration.tonyRespondedToAustin
   ) {
-    return "Tony has not provided the required independent contribution yet.";
+    return "Tony has not responded to Austin's contribution yet.";
   }
   return undefined;
 }

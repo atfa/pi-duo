@@ -75,6 +75,8 @@ export interface DuoCollaborationState {
   austinContributed: boolean;
   tonyContributed: boolean;
   tonyInitialContribution: boolean;
+  /** True only after Austin has answered Tony and Tony has replied in turn. */
+  tonyRespondedToAustin?: boolean;
   contested: boolean;
   planRevision: number;
   plan?: string;
@@ -116,4 +118,3 @@ export interface PeerMessage {
   timestamp: string;
   userTurn: number;
 }
-

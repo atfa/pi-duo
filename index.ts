@@ -664,13 +664,21 @@ export default function piDuo(pi: ExtensionAPI) {
           austinContributed: false,
           tonyContributed: true,
           tonyInitialContribution: true,
+          tonyRespondedToAustin: false,
           contested: false,
           planRevision: 0,
         };
         return;
       }
 
+      const hadTonyInitialContribution =
+        draft.collaboration.tonyInitialContribution;
       draft.collaboration.tonyContributed = true;
+      if (
+        draft.collaboration.austinContributed &&
+        hadTonyInitialContribution
+      )
+        draft.collaboration.tonyRespondedToAustin = true;
       draft.collaboration.tonyInitialContribution = true;
 
       if (kind === "objection") {
@@ -748,6 +756,7 @@ export default function piDuo(pi: ExtensionAPI) {
           austinContributed: true,
           tonyContributed: false,
           tonyInitialContribution: false,
+          tonyRespondedToAustin: false,
           contested: false,
           planRevision: 0,
         };
@@ -1140,6 +1149,7 @@ export default function piDuo(pi: ExtensionAPI) {
               austinContributed: actor === "austin",
               tonyContributed: actor === "tony",
               tonyInitialContribution: actor === "tony",
+              tonyRespondedToAustin: false,
               contested: Boolean(params.unresolvedObjection),
               planRevision: 1,
               plan: planText,
@@ -2097,6 +2107,7 @@ export default function piDuo(pi: ExtensionAPI) {
           austinContributed: false,
           tonyContributed: false,
           tonyInitialContribution: false,
+          tonyRespondedToAustin: false,
           contested: false,
           planRevision: 0,
         };
