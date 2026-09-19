@@ -2,6 +2,7 @@ import type {
   AgentId,
   DuoCollaborationState,
   DuoConfig,
+  DuoState,
   PeerMessageKind,
   WritePolicy,
 } from "./types.js";
@@ -94,6 +95,109 @@ export function isBlockedByFirstSyncBarrier(
   );
 }
 
+export function collaborationReadyToConverge(
+  collaboration?: DuoCollaborationState,
+): boolean {
+  if (!collaboration) return false;
+  if (collaboration.degraded) return true;
+  return (
+    collaboration.austinContributed &&
+    collaboration.tonyContributed &&
+    collaboration.tonyInitialContribution
+  );
+}
+
+export function validatePlanCommit(
+  actor: AgentId,
+  collaboration?: DuoCollaborationState,
+): string | undefined {
+  if (actor !== "austin") {
+    return "Only Austin, as the foreground integrator, may commit the shared working plan.";
+  }
+  if (!collaboration) {
+    return "No active collaboration state.";
+  }
+  if (collaboration.degraded) {
+    if (
+      collaboration.phase === "explore" ||
+      collaboration.phase === "converge"
+    ) {
+      return undefined;
+    }
+  }
+  if (collaboration.phase !== "converge") {
+    return `Plan commit requires CONVERGE phase; current phase is ${collaboration.phase.toUpperCase()}.`;
+  }
+  if (!collaboration.austinContributed) {
+    return "Austin has not contributed to the working agreement yet.";
+  }
+  if (
+    !collaboration.tonyContributed ||
+    !collaboration.tonyInitialContribution
+  ) {
+    return "Tony has not provided the required independent contribution yet.";
+  }
+  return undefined;
+}
+
+export function validateReadyForVerification(
+  actor: AgentId,
+  collaboration?: DuoCollaborationState,
+): string | undefined {
+  if (actor !== "austin") {
+    return "Only Austin may declare the integrated deliverable ready for verification.";
+  }
+  if (!collaboration) {
+    return "No active collaboration state.";
+  }
+  if (collaboration.phase !== "execute") {
+    return `ready_for_verification requires EXECUTE phase; current phase is ${collaboration.phase.toUpperCase()}.`;
+  }
+  return undefined;
+}
+
+export function validateManualCompletion(
+  actor: AgentId,
+  collaboration?: DuoCollaborationState,
+  reviewStatus?: "pending" | "reported" | "failed",
+): string | undefined {
+  if (actor !== "austin") {
+    return "Only Austin may manually finalize the deliverable.";
+  }
+  if (!collaboration) {
+    return "No active collaboration state.";
+  }
+  if (collaboration.phase === "complete") {
+    return undefined;
+  }
+  if (collaboration.phase !== "verify") {
+    return `Manual completion requires VERIFY phase; current phase is ${collaboration.phase.toUpperCase()}.`;
+  }
+  if (reviewStatus !== "reported") {
+    return "Manual completion requires a reported Tony verification.";
+  }
+  return undefined;
+}
+
+export function validateReopen(
+  actor: AgentId,
+  collaboration?: DuoCollaborationState,
+): string | undefined {
+  if (actor !== "austin") {
+    return "Only Austin may reopen the integrated deliverable.";
+  }
+  if (!collaboration) {
+    return "No active collaboration state.";
+  }
+  if (
+    collaboration.phase !== "verify" &&
+    collaboration.phase !== "complete"
+  ) {
+    return `reopen requires VERIFY or COMPLETE phase; current phase is ${collaboration.phase.toUpperCase()}.`;
+  }
+  return undefined;
+}
+
 export function parseAgentTarget(value: string | undefined): AgentId | undefined {
   const normalized = value?.trim().toLowerCase();
   return normalized === "austin" || normalized === "tony"
@@ -171,6 +275,33 @@ export function completionGateNotice(state: {
   return undefined;
 }
 
+
+export function tonyShouldYieldAfterSend(response: string): boolean {
+  return (
+    response.startsWith("Message delivered") ||
+    response.startsWith("High-priority message saved")
+  );
+}
+
+export function applyReviewReported(
+  draft: DuoState,
+  userTurn: number,
+): boolean {
+  if (
+    draft.review?.status !== "pending" ||
+    draft.review.userTurn !== userTurn ||
+    draft.collaboration?.phase !== "verify"
+  ) {
+    return false;
+  }
+  draft.review.status = "reported";
+  draft.review.updatedAt = new Date().toISOString();
+  delete draft.review.error;
+  if (draft.collaboration) {
+    draft.collaboration.phase = "complete";
+  }
+  return true;
+}
 
 export function canCompleteReview(
   actor: AgentId,

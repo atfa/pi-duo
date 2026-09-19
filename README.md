@@ -12,11 +12,11 @@
 <p align="center">
   <a href="https://github.com/atfa/pi-duo"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-atfa%2Fpi--duo-181717?logo=github"></a>
   <img alt="Pi" src="https://img.shields.io/badge/Pi-%E2%89%A5%200.85.1-7C3AED">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.3.0-00C2A8">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.3.1-00C2A8">
   <img alt="Tests" src="https://img.shields.io/badge/tests-passing-22C55E">
 </p>
 
-> **0.3.0 提示**：pi-duo 现已全面升级为 **“先协作、后执行、最后验证”** 的对等协作状态机。Austin 与 Tony 从传统的“写-审”流水线，演进为涵盖探索、收敛、执行与独立验收的真正对等协作模式。
+> **0.3.1 提示**：pi-duo 强化了 **“先协作、后执行、最后验证”** 的状态机规则：消息 `kind` 纯语义化、生命周期严格由控制面动作原子驱动、杜绝死锁与空响应异常。
 
 ## 为什么需要 pi-duo？
 
@@ -391,8 +391,10 @@ NODE
   - `finding`：🔍 验收或调查发现的问题
   - `question`：❓ 关键提问
   - `decision`：📋 决策同步
-- `reviewComplete`：仅 Tony 在验收阶段使用；只有完成对当前交付物的独立验证后才设为 `true`。
+- `reviewComplete`：仅 Tony 在验收阶段使用；只有完成对当前交付物的独立验证后才设为 `true`。控制面会自动原子完成 `VERIFY → COMPLETE` 跃迁并唤醒 Austin；Tony 不需要且不能在 `reviewComplete` 后调用 `duo_checkpoint(action="complete")`。
 - `reviewFinding`：仅 Tony 在验收阶段使用；发现需要 Austin 修改的问题时设为 `true`，强制唤醒 Austin，但保持 review 挂起。
+
+> **注意**：`kind` 仅用于消息语义、审计和 UI 展示，不改变 collaboration phase 或 review lifecycle。
 
 `important` 和 `decision` 可以使用保留槽，并在总预算耗尽后进入 deferred 持久化槽。
 
@@ -401,8 +403,8 @@ NODE
 维护双方的工作方案共识（Working Agreement），驱动 `CONVERGE -> EXECUTE` 阶段跃迁：
 
 - `get`：读取当前共识方案及未决异议；
-- `propose` / `revise`：提出或修正方案；
-- `commit`：正式敲定方案，协作状态机进入 `EXECUTE` 阶段；
+- `propose` / `revise`：提出或修正方案；双方均有贡献且完成独立探索后才进入 `CONVERGE`；
+- `commit`：仅 Austin 可执行；必须在 `CONVERGE` 阶段且双方均已提供贡献后，才正式敲定方案进入 `EXECUTE` 阶段；
 - `unresolvedObjection`：允许保留无法消除的技术分歧，不追求虚假共识。
 
 ### `duo_checkpoint`
@@ -410,9 +412,9 @@ NODE
 驱动 `EXECUTE -> VERIFY -> COMPLETE` 阶段跃迁，将 Review 解耦并移至交付终点：
 
 - `status`：查看当前协作阶段与验收状态；
-- `ready_for_verification`：Austin 完成编码后主动发起验收请求，唤醒 Tony 切换为独立验收模式；
-- `complete`：Tony 验证通过后确认完成（或 Austin 确认交付）；
-- `reopen`：验收发现严重问题时重新打开回到 `EXECUTE` 阶段。
+- `ready_for_verification`：仅 Austin 在 `EXECUTE` 阶段调用；代码实现完成后主动发起验收请求，唤醒 Tony 切换为独立验收模式（进入 `VERIFY` 阶段）；
+- `complete`：正常由 Tony `reviewComplete=true` 自动完成；此命令仅供 Austin 手动确认已 reported 的验收；
+- `reopen`：仅 Austin 在 `VERIFY` 或 `COMPLETE` 阶段调用；验收发现严重问题时重新打开回到 `EXECUTE` 阶段。
 
 ### `duo_status`
 
@@ -440,7 +442,7 @@ NODE
 - `done`
 - `blocked`
 
-todo 可指定 `owner: austin | tony`，并支持 `expectedRevision` 防止并发覆盖。在 `CONVERGE` 阶段若有 todo 被认领为 `in_progress`，会自动平滑推进至 `EXECUTE`。
+todo 可指定 `owner: austin | tony`，并支持 `expectedRevision` 防止并发覆盖。`duo_todo` 仅管理工作项，不改变协作阶段；只有 `duo_plan(action="commit")` 才会正式推进 `CONVERGE → EXECUTE`。
 
 ### `duo_decisions`
 

@@ -4,11 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  applyReviewReported,
   blocksDuoRestart,
   canCompleteReview,
   canMutateDuoState,
   canMutateWorkspace,
   canUseWorkspaceAction,
+  collaborationReadyToConverge,
   completionGateNotice,
   controlPlaneDelivery,
   dispatchControlPlaneTask,
@@ -20,7 +22,12 @@ import {
   reviewBelongsToTurn,
   roleDescription,
   shouldInspectPeerOutcome,
+  tonyShouldYieldAfterSend,
   triggeringDelivery,
+  validateManualCompletion,
+  validatePlanCommit,
+  validateReadyForVerification,
+  validateReopen,
   workspaceHandoffRecipient,
 } from "../src/coordinator.js";
 import { DEFAULT_CONFIG, DuoStore } from "../src/store.js";
@@ -425,3 +432,388 @@ test("isBlockedByFirstSyncBarrier blocks Austin in explore phase before Tony con
     false,
   );
 });
+
+test("collaborationReadyToConverge requires bilateral contributions in normal mode", () => {
+  assert.equal(collaborationReadyToConverge(undefined), false);
+  // Degraded mode is immediately ready
+  assert.equal(
+    collaborationReadyToConverge({
+      userTurn: 1,
+      phase: "explore",
+      austinContributed: false,
+      tonyContributed: false,
+      tonyInitialContribution: false,
+      contested: false,
+      planRevision: 0,
+      degraded: true,
+    }),
+    true,
+  );
+  // Only Austin contributed
+  assert.equal(
+    collaborationReadyToConverge({
+      userTurn: 1,
+      phase: "explore",
+      austinContributed: true,
+      tonyContributed: false,
+      tonyInitialContribution: false,
+      contested: false,
+      planRevision: 0,
+    }),
+    false,
+  );
+  // Only Tony contributed
+  assert.equal(
+    collaborationReadyToConverge({
+      userTurn: 1,
+      phase: "explore",
+      austinContributed: false,
+      tonyContributed: true,
+      tonyInitialContribution: true,
+      contested: false,
+      planRevision: 0,
+    }),
+    false,
+  );
+  // Both contributed but tonyInitialContribution is false
+  assert.equal(
+    collaborationReadyToConverge({
+      userTurn: 1,
+      phase: "explore",
+      austinContributed: true,
+      tonyContributed: true,
+      tonyInitialContribution: false,
+      contested: false,
+      planRevision: 0,
+    }),
+    false,
+  );
+  // Both contributed and tonyInitialContribution is true
+  assert.equal(
+    collaborationReadyToConverge({
+      userTurn: 1,
+      phase: "explore",
+      austinContributed: true,
+      tonyContributed: true,
+      tonyInitialContribution: true,
+      contested: false,
+      planRevision: 0,
+    }),
+    true,
+  );
+});
+
+test("validatePlanCommit enforces actor, phase, and contribution guards", () => {
+  const baseCollab = {
+    userTurn: 1,
+    phase: "converge" as const,
+    austinContributed: true,
+    tonyContributed: true,
+    tonyInitialContribution: true,
+    contested: false,
+    planRevision: 1,
+  };
+
+  // Tony cannot commit
+  assert.match(
+    validatePlanCommit("tony", baseCollab) ?? "",
+    /Only Austin/i,
+  );
+
+  // Missing collaboration state
+  assert.match(
+    validatePlanCommit("austin", undefined) ?? "",
+    /No active collaboration/i,
+  );
+
+  // Cannot commit in EXPLORE
+  assert.match(
+    validatePlanCommit("austin", { ...baseCollab, phase: "explore" }) ?? "",
+    /requires CONVERGE phase/i,
+  );
+
+  // Cannot commit in EXECUTE
+  assert.match(
+    validatePlanCommit("austin", { ...baseCollab, phase: "execute" }) ?? "",
+    /requires CONVERGE phase/i,
+  );
+
+  // Austin hasn't contributed
+  assert.match(
+    validatePlanCommit("austin", { ...baseCollab, austinContributed: false }) ?? "",
+    /Austin has not contributed/i,
+  );
+
+  // Tony hasn't contributed
+  assert.match(
+    validatePlanCommit("austin", { ...baseCollab, tonyContributed: false }) ?? "",
+    /Tony has not provided the required independent contribution/i,
+  );
+
+  // Valid commit in CONVERGE
+  assert.equal(validatePlanCommit("austin", baseCollab), undefined);
+
+  // Degraded mode allows commit in EXPLORE or CONVERGE
+  assert.equal(
+    validatePlanCommit("austin", {
+      ...baseCollab,
+      phase: "explore",
+      degraded: true,
+    }),
+    undefined,
+  );
+  assert.equal(
+    validatePlanCommit("austin", {
+      ...baseCollab,
+      phase: "converge",
+      degraded: true,
+    }),
+    undefined,
+  );
+});
+
+test("validateReadyForVerification enforces actor and EXECUTE phase guards", () => {
+  const baseCollab = {
+    userTurn: 1,
+    phase: "execute" as const,
+    austinContributed: true,
+    tonyContributed: true,
+    tonyInitialContribution: true,
+    contested: false,
+    planRevision: 1,
+  };
+
+  // Tony cannot declare ready
+  assert.match(
+    validateReadyForVerification("tony", baseCollab) ?? "",
+    /Only Austin/i,
+  );
+
+  // Missing collaboration state
+  assert.match(
+    validateReadyForVerification("austin", undefined) ?? "",
+    /No active collaboration/i,
+  );
+
+  // Cannot declare ready in EXPLORE or CONVERGE
+  assert.match(
+    validateReadyForVerification("austin", { ...baseCollab, phase: "explore" }) ?? "",
+    /requires EXECUTE phase/i,
+  );
+  assert.match(
+    validateReadyForVerification("austin", { ...baseCollab, phase: "converge" }) ?? "",
+    /requires EXECUTE phase/i,
+  );
+  assert.match(
+    validateReadyForVerification("austin", { ...baseCollab, phase: "verify" }) ?? "",
+    /requires EXECUTE phase/i,
+  );
+
+  // Valid in EXECUTE
+  assert.equal(validateReadyForVerification("austin", baseCollab), undefined);
+});
+
+test("validateManualCompletion enforces actor, phase, and reported review guards", () => {
+  const baseCollab = {
+    userTurn: 1,
+    phase: "verify" as const,
+    austinContributed: true,
+    tonyContributed: true,
+    tonyInitialContribution: true,
+    contested: false,
+    planRevision: 1,
+  };
+
+  // Tony cannot manually finalize
+  assert.match(
+    validateManualCompletion("tony", baseCollab, "reported") ?? "",
+    /Only Austin/i,
+  );
+
+  // Missing state
+  assert.match(
+    validateManualCompletion("austin", undefined, "reported") ?? "",
+    /No active collaboration/i,
+  );
+
+  // Already complete is allowed (noop)
+  assert.equal(
+    validateManualCompletion("austin", { ...baseCollab, phase: "complete" }, "reported"),
+    undefined,
+  );
+
+  // Cannot complete in EXECUTE or EXPLORE
+  assert.match(
+    validateManualCompletion("austin", { ...baseCollab, phase: "execute" }, "reported") ?? "",
+    /requires VERIFY phase/i,
+  );
+
+  // Cannot complete if review is pending or failed
+  assert.match(
+    validateManualCompletion("austin", baseCollab, "pending") ?? "",
+    /requires a reported Tony verification/i,
+  );
+  assert.match(
+    validateManualCompletion("austin", baseCollab, "failed") ?? "",
+    /requires a reported Tony verification/i,
+  );
+
+  // Valid in VERIFY with reported review
+  assert.equal(
+    validateManualCompletion("austin", baseCollab, "reported"),
+    undefined,
+  );
+});
+
+test("validateReopen enforces actor and phase guards", () => {
+  const baseCollab = {
+    userTurn: 1,
+    phase: "verify" as const,
+    austinContributed: true,
+    tonyContributed: true,
+    tonyInitialContribution: true,
+    contested: false,
+    planRevision: 1,
+  };
+
+  // Tony cannot reopen
+  assert.match(
+    validateReopen("tony", baseCollab) ?? "",
+    /Only Austin/i,
+  );
+
+  // Missing state
+  assert.match(
+    validateReopen("austin", undefined) ?? "",
+    /No active collaboration/i,
+  );
+
+  // Cannot reopen in EXPLORE, CONVERGE, or EXECUTE
+  assert.match(
+    validateReopen("austin", { ...baseCollab, phase: "explore" }) ?? "",
+    /requires VERIFY or COMPLETE phase/i,
+  );
+  assert.match(
+    validateReopen("austin", { ...baseCollab, phase: "converge" }) ?? "",
+    /requires VERIFY or COMPLETE phase/i,
+  );
+  assert.match(
+    validateReopen("austin", { ...baseCollab, phase: "execute" }) ?? "",
+    /requires VERIFY or COMPLETE phase/i,
+  );
+
+  // Valid in VERIFY or COMPLETE
+  assert.equal(validateReopen("austin", baseCollab), undefined);
+  assert.equal(
+    validateReopen("austin", { ...baseCollab, phase: "complete" }),
+    undefined,
+  );
+});
+
+test("tonyShouldYieldAfterSend only yields on successful delivery or deferred persistence", () => {
+  assert.equal(
+    tonyShouldYieldAfterSend("Message delivered to Austin's persistent session."),
+    true,
+  );
+  assert.equal(
+    tonyShouldYieldAfterSend(
+      "High-priority message saved in Austin's persistent context and audit log without triggering another turn.",
+    ),
+    true,
+  );
+  assert.equal(
+    tonyShouldYieldAfterSend(
+      "Choose exactly one review state: reviewFinding for requested changes, or reviewComplete for final sign-off. End this turn now.",
+    ),
+    false,
+  );
+  assert.equal(
+    tonyShouldYieldAfterSend(
+      "Suppressed as substantially similar to a recent message from this agent.",
+    ),
+    false,
+  );
+  assert.equal(
+    tonyShouldYieldAfterSend(
+      "Peer-message budget exhausted (6 this user turn); all 2 context-only overflow slots are used until the next user input. Continue independently and do not retry this message.",
+    ),
+    false,
+  );
+  assert.equal(
+    tonyShouldYieldAfterSend(
+      "Stale Tony message for user turn 1 was discarded; current user turn is 2. End this turn now.",
+    ),
+    false,
+  );
+  assert.equal(
+    tonyShouldYieldAfterSend(
+      "No pending Tony review exists. Send ordinary coordination with reviewComplete omitted.",
+    ),
+    false,
+  );
+});
+
+test("applyReviewReported atomically transitions review and collaboration state", () => {
+  const createBaseState = () => ({
+    version: "0.3.1",
+    revision: 1,
+    status: "active" as const,
+    userTurn: 1,
+    agents: {
+      austin: { provider: "prov", modelId: "mod" },
+      tony: { provider: "prov", modelId: "mod" },
+    },
+    collaboration: {
+      userTurn: 1,
+      phase: "verify" as "explore" | "converge" | "execute" | "verify" | "complete",
+      austinContributed: true,
+      tonyContributed: true,
+      tonyInitialContribution: true,
+      contested: false,
+      planRevision: 1,
+    },
+    review: {
+      userTurn: 1,
+      status: "pending" as "pending" | "reported" | "failed",
+      startedAt: "2026-09-19T00:00:00.000Z",
+      error: "previous error",
+    },
+    todo: [],
+    decisions: [],
+    peerMessageCount: 0,
+    lastActivityAt: "2026-09-19T00:00:00.000Z",
+  });
+
+  // 1. Successful atomic transition
+  const state = createBaseState();
+  const ok = applyReviewReported(state as any, 1);
+  assert.equal(ok, true);
+  assert.equal(state.review.status, "reported");
+  assert.equal(state.review.error, undefined);
+  assert.equal(state.collaboration.phase, "complete");
+
+  // 2. Rejected if phase is not verify
+  const notVerify = createBaseState();
+  notVerify.collaboration.phase = "execute";
+  assert.equal(applyReviewReported(notVerify as any, 1), false);
+  assert.equal(notVerify.review.status, "pending");
+  assert.equal(notVerify.collaboration.phase, "execute");
+
+  // 3. Rejected if review status is not pending
+  const alreadyReported = createBaseState();
+  (alreadyReported.review as any).status = "reported";
+  assert.equal(applyReviewReported(alreadyReported as any, 1), false);
+
+  // 4. Rejected if turn does not match
+  const wrongTurn = createBaseState();
+  assert.equal(applyReviewReported(wrongTurn as any, 2), false);
+  assert.equal(wrongTurn.review.status, "pending");
+  assert.equal(wrongTurn.collaboration.phase, "verify");
+
+  // 5. Rejected if no review exists
+  const noReview = createBaseState();
+  delete (noReview as any).review;
+  assert.equal(applyReviewReported(noReview as any, 1), false);
+});
+
+

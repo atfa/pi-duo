@@ -13,11 +13,13 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
+  applyReviewReported,
   blocksDuoRestart,
   canCompleteReview,
   canMutateDuoState,
   canMutateWorkspace,
   canUseWorkspaceAction,
+  collaborationReadyToConverge,
   controlPlaneDelivery,
   completionGateNotice,
   dispatchControlPlaneTask,
@@ -29,7 +31,12 @@ import {
   reviewBelongsToTurn,
   roleDescription,
   shouldInspectPeerOutcome,
+  tonyShouldYieldAfterSend,
   triggeringDelivery,
+  validateManualCompletion,
+  validatePlanCommit,
+  validateReadyForVerification,
+  validateReopen,
   workspaceHandoffRecipient,
 } from "./src/coordinator.js";
 import {
@@ -634,25 +641,22 @@ export default function piDuo(pi: ExtensionAPI) {
           contested: false,
           planRevision: 0,
         };
-      } else {
-        draft.collaboration.tonyContributed = true;
-        draft.collaboration.tonyInitialContribution = true;
-        if (kind === "objection") {
-          draft.collaboration.contested = true;
-          draft.collaboration.unresolvedObjection = content.slice(0, 300);
-        }
-        if (kind === "verification") {
-          draft.collaboration.phase = "complete";
-          if (draft.review) draft.review.status = "reported";
-        } else if (kind === "finding") {
-          if (draft.review) draft.review.status = "pending";
-        }
-        if (
-          draft.collaboration.phase === "explore" &&
-          draft.collaboration.austinContributed
-        ) {
-          draft.collaboration.phase = "converge";
-        }
+        return;
+      }
+
+      draft.collaboration.tonyContributed = true;
+      draft.collaboration.tonyInitialContribution = true;
+
+      if (kind === "objection") {
+        draft.collaboration.contested = true;
+        draft.collaboration.unresolvedObjection = content.slice(0, 300);
+      }
+
+      if (
+        draft.collaboration.phase === "explore" &&
+        collaborationReadyToConverge(draft.collaboration)
+      ) {
+        draft.collaboration.phase = "converge";
       }
     });
 
@@ -721,14 +725,15 @@ export default function piDuo(pi: ExtensionAPI) {
           contested: false,
           planRevision: 0,
         };
-      } else {
-        draft.collaboration.austinContributed = true;
-        if (
-          draft.collaboration.phase === "explore" &&
-          draft.collaboration.tonyContributed
-        ) {
-          draft.collaboration.phase = "converge";
-        }
+        return;
+      }
+
+      draft.collaboration.austinContributed = true;
+      if (
+        draft.collaboration.phase === "explore" &&
+        collaborationReadyToConverge(draft.collaboration)
+      ) {
+        draft.collaboration.phase = "converge";
       }
     });
 
@@ -945,12 +950,10 @@ export default function piDuo(pi: ExtensionAPI) {
       description: `Send a concise, materially useful message to ${agentName(otherAgent(actor))}. This enters the peer's real persistent context.`,
       parameters: SendSchema,
       execute: async (_id, params) => {
-        if (actor === "tony") {
-          tonyMustYield = true;
-          if (params.reviewComplete && params.reviewFinding)
-            return result(
-              "Choose exactly one review state: reviewFinding for requested changes, or reviewComplete for final sign-off. End this turn now.",
-            );
+        if (actor === "tony" && params.reviewComplete && params.reviewFinding) {
+          return result(
+            "Choose exactly one review state: reviewFinding for requested changes, or reviewComplete for final sign-off. End this turn now.",
+          );
         }
         if (actor === "tony" && params.reviewFinding) {
           if (!store) return result("Duo has not been started");
@@ -973,9 +976,14 @@ export default function piDuo(pi: ExtensionAPI) {
             true,
             params.kind ?? "finding",
           );
+          if (tonyShouldYieldAfterSend(response)) {
+            tonyMustYield = true;
+          }
           setReviewIndicator("waiting", "Tony 已提出修改要求");
           return result(
-            `${response} Review remains pending for Austin's fixes and Tony's final verification. End this turn now.`,
+            tonyMustYield
+              ? `${response} Review remains pending for Austin's fixes and Tony's final verification. End this turn now.`
+              : response,
           );
         }
         if (actor === "tony" && params.reviewComplete) {
@@ -1008,8 +1016,9 @@ export default function piDuo(pi: ExtensionAPI) {
           const reported = await markReviewReported(current.review.userTurn);
           if (!reported)
             return result(
-              "Review report was saved, but a newer user turn replaced this review before it could be marked complete.",
+              "Review report was saved, but verification state changed or a newer user turn replaced this review before it could be marked complete.",
             );
+          tonyMustYield = true;
           sendMessageSafely(
             {
               customType: "pi-duo-peer",
@@ -1038,8 +1047,11 @@ export default function piDuo(pi: ExtensionAPI) {
                 false,
                 params.kind,
               );
+        if (actor === "tony" && tonyShouldYieldAfterSend(response)) {
+          tonyMustYield = true;
+        }
         return result(
-          actor === "tony"
+          actor === "tony" && tonyMustYield
             ? `${response} End this turn now; wait for Austin's next message.`
             : response,
         );
@@ -1067,11 +1079,19 @@ export default function piDuo(pi: ExtensionAPI) {
           return result("plan is required for propose, revise, or commit");
         }
 
+        if (params.action === "commit") {
+          const current = await store.readState();
+          const error = validatePlanCommit(actor, current?.collaboration);
+          if (error) {
+            return result(error, current);
+          }
+        }
+
         const state = await store.update((draft) => {
           if (!draft.collaboration) {
             draft.collaboration = {
               userTurn: guard.turn,
-              phase: params.action === "commit" ? "execute" : "converge",
+              phase: params.action === "commit" ? "execute" : "explore",
               austinContributed: actor === "austin",
               tonyContributed: actor === "tony",
               tonyInitialContribution: actor === "tony",
@@ -1088,15 +1108,18 @@ export default function piDuo(pi: ExtensionAPI) {
                 params.unresolvedObjection;
               draft.collaboration.contested = true;
             }
-            if (params.action === "commit") {
-              draft.collaboration.phase = "execute";
-            } else if (draft.collaboration.phase === "explore") {
-              draft.collaboration.phase = "converge";
-            }
             if (actor === "austin") draft.collaboration.austinContributed = true;
             if (actor === "tony") {
               draft.collaboration.tonyContributed = true;
               draft.collaboration.tonyInitialContribution = true;
+            }
+            if (params.action === "commit") {
+              draft.collaboration.phase = "execute";
+            } else if (
+              draft.collaboration.phase === "explore" &&
+              collaborationReadyToConverge(draft.collaboration)
+            ) {
+              draft.collaboration.phase = "converge";
             }
           }
         }, params.expectedRevision);
@@ -1123,6 +1146,12 @@ export default function piDuo(pi: ExtensionAPI) {
           );
         }
         if (params.action === "ready_for_verification") {
+          const err = validateReadyForVerification(
+            actor,
+            currentState.collaboration,
+          );
+          if (err) return result(err, currentState);
+          const timestamp = new Date().toISOString();
           const state = await store.update((draft) => {
             if (!draft.collaboration) {
               draft.collaboration = {
@@ -1141,7 +1170,8 @@ export default function piDuo(pi: ExtensionAPI) {
               userTurn: guard.turn,
               status: "pending",
               summary: params.summary,
-              updatedAt: new Date().toISOString(),
+              startedAt: timestamp,
+              updatedAt: timestamp,
             };
           });
           setReviewIndicator("working", "Tony 独立验证中");
@@ -1152,6 +1182,15 @@ export default function piDuo(pi: ExtensionAPI) {
           );
         }
         if (params.action === "complete") {
+          if (currentState.collaboration?.phase === "complete") {
+            return result("Collaboration is already complete.", currentState);
+          }
+          const err = validateManualCompletion(
+            actor,
+            currentState.collaboration,
+            currentState.review?.status,
+          );
+          if (err) return result(err, currentState);
           const state = await store.update((draft) => {
             if (draft.collaboration) draft.collaboration.phase = "complete";
             if (draft.review) {
@@ -1167,9 +1206,11 @@ export default function piDuo(pi: ExtensionAPI) {
           );
         }
         if (params.action === "reopen") {
+          const err = validateReopen(actor, currentState.collaboration);
+          if (err) return result(err, currentState);
           const state = await store.update((draft) => {
             if (draft.collaboration) draft.collaboration.phase = "execute";
-            if (draft.review) draft.review.status = "pending";
+            delete draft.review;
           });
           setReviewIndicator("working", "重新打开执行");
           return result(
@@ -1248,9 +1289,6 @@ export default function piDuo(pi: ExtensionAPI) {
           return result("Duo is stopped; use /duo resume before changing shared state.", current);
         let message = "";
         const state = await store.update((draft) => {
-          if (draft.collaboration?.phase === "converge") {
-            draft.collaboration.phase = "execute";
-          }
           if (params.action === "add") {
             if (!params.text?.trim())
               throw new Error("text is required for add");
@@ -1601,20 +1639,26 @@ export default function piDuo(pi: ExtensionAPI) {
 
   const markReviewReported = async (userTurn: number): Promise<boolean> => {
     if (!store) return false;
+
     const current = await store.readState();
-    if (current?.review?.status !== "pending" || current.review.userTurn !== userTurn)
+
+    if (
+      !current ||
+      current.review?.status !== "pending" ||
+      current.review.userTurn !== userTurn ||
+      current.collaboration?.phase !== "verify"
+    ) {
       return false;
+    }
+
     try {
       await store.update((draft) => {
-        if (
-          draft.review?.status === "pending" &&
-          draft.review.userTurn === userTurn
-        ) {
-          draft.review.status = "reported";
-          draft.review.updatedAt = new Date().toISOString();
-          delete draft.review.error;
+        const ok = applyReviewReported(draft, userTurn);
+        if (!ok) {
+          throw new Error("Verification state changed");
         }
       }, current.revision);
+
       setReviewIndicator("complete");
       return true;
     } catch {
@@ -1663,7 +1707,7 @@ export default function piDuo(pi: ExtensionAPI) {
                 content: `[Tony error]\n${outcome.error}\n(Collaboration degraded to single-agent mode)`,
                 display: true,
               },
-              { triggerTurn: false },
+              { triggerTurn: true, deliverAs: "steer" },
               generation,
             );
             return;
@@ -1672,6 +1716,31 @@ export default function piDuo(pi: ExtensionAPI) {
             const final = outcome?.text.slice(0, 4000) ?? "";
             if (final) {
               await sendToAustin(final, "important", true, false, "proposal");
+            } else {
+              if (store) {
+                await store.update((draft) => {
+                  if (
+                    draft.collaboration &&
+                    draft.collaboration.userTurn === userTurn
+                  ) {
+                    draft.collaboration.degraded = true;
+                    draft.collaboration.tonyInitialContribution = true;
+                  }
+                });
+              }
+
+              sendMessageSafely(
+                {
+                  customType: "pi-duo-peer",
+                  content:
+                    "[Tony collaboration unavailable]\n" +
+                    "Tony completed the EXPLORE turn without producing a usable contribution. " +
+                    "The collaboration has degraded to single-agent mode for this user turn.",
+                  display: true,
+                },
+                { triggerTurn: true, deliverAs: "steer" },
+                generation,
+              );
             }
           }
         } finally {
@@ -1718,7 +1787,7 @@ export default function piDuo(pi: ExtensionAPI) {
           await activeTony.sendCustomMessage(
             {
               customType: "pi-duo-user-task",
-              content: `[Verification Request from Austin]\nAustin reports that the current deliverable is ready for independent verification.${summary ? `\nSummary: ${summary}` : ""}\n\nNow switch roles:\n- Independently verify the actual current implementation.\n- Re-read the changed files.\n- Run appropriate tests and validations.\n- Look for regressions and violated assumptions.\n\nIf actionable problems remain:\n  Send details with duo_send(kind='finding' | 'objection', reviewFinding=true, importance='important').\nIf verification succeeds:\n  Confirm with duo_send(kind='verification', reviewComplete=true, message='Verification passed...', importance='important') and call duo_checkpoint(action='complete').`,
+              content: `[Verification Request from Austin]\nAustin reports that the current deliverable is ready for independent verification.${summary ? `\nSummary: ${summary}` : ""}\n\nNow switch roles:\n- Independently verify the actual current implementation.\n- Re-read the changed files.\n- Run appropriate tests and validations.\n- Look for regressions and violated assumptions.\n\nIf actionable problems remain:\n  Send one consolidated report with:\n  duo_send(\n    kind='finding',\n    reviewFinding=true,\n    importance='important'\n  )\n\nIf verification succeeds:\n  Send one consolidated final report with:\n  duo_send(\n    kind='verification',\n    reviewComplete=true,\n    importance='important'\n  )\n\nreviewComplete=true is the final verification action.\nDo not call duo_checkpoint after duo_send.\nThe control plane will record completion and wake Austin automatically.`,
               display: false,
             },
             triggeringDelivery(false),
@@ -1740,24 +1809,35 @@ export default function piDuo(pi: ExtensionAPI) {
           }
           if (tonySentSequence === sentBefore) {
             const final = outcome?.text.slice(0, 4000) ?? "";
+
             if (final) {
-              await sendToAustin(final, "important", true, false, "verification");
-            } else {
-              await markReviewFailed(
-                taskTurn,
-                "Tony completed without a verification report",
-              );
-              sendMessageSafely(
-                {
-                  customType: "pi-duo-peer",
-                  content:
-                    "[Tony verification unavailable]\nTony completed without a verification report. Austin should finish with independent verification and disclose that peer verification was unavailable.",
-                  display: true,
-                },
-                { triggerTurn: true },
-                generation,
+              await sendToAustin(
+                `[Unstructured verification output]\n${final}`,
+                "important",
+                true,
+                false,
+                "finding",
               );
             }
+
+            await markReviewFailed(
+              taskTurn,
+              "Tony completed the verification turn without an explicit reviewFinding or reviewComplete control-plane report",
+            );
+
+            sendMessageSafely(
+              {
+                customType: "pi-duo-peer",
+                content:
+                  "[Tony verification incomplete]\n" +
+                  "Tony returned from verification without an explicit " +
+                  "reviewFinding=true or reviewComplete=true report. " +
+                  "The result was not accepted as peer verification.",
+                display: true,
+              },
+              { triggerTurn: true, deliverAs: "steer" },
+              generation,
+            );
           }
         } finally {
           if (activeTonyUserTurn === taskTurn) activeTonyUserTurn = undefined;
@@ -2086,14 +2166,36 @@ export default function piDuo(pi: ExtensionAPI) {
         }
         if (target === "tony") {
           await currentStore.update((draft) => {
+            if (draft.collaboration) {
+              draft.collaboration.degraded = true;
+
+              if (
+                draft.collaboration.phase === "explore" &&
+                !draft.collaboration.tonyInitialContribution
+              ) {
+                draft.collaboration.tonyInitialContribution = true;
+              }
+            }
+
             if (draft.review?.status === "pending") {
               draft.review.status = "failed";
               draft.review.error =
-                "Tony review was interrupted by /duo stop tony";
+                "Tony verification was interrupted by /duo stop tony";
               draft.review.updatedAt = new Date().toISOString();
             }
           });
           setReviewIndicator("failed", "Tony 已被用户定向停止");
+          sendMessageSafely(
+            {
+              customType: "pi-duo-peer",
+              content:
+                "[Tony stopped]\n" +
+                "Tony was stopped by the user. Continue this turn in degraded single-agent mode. " +
+                "Do not claim peer verification while Tony is unavailable.",
+              display: true,
+            },
+            { triggerTurn: true, deliverAs: "steer" },
+          );
           ctx.ui.notify(
             "Tony is being stopped; Austin and the Duo session remain active. Use /duo resume to start Tony again.",
             "info",
