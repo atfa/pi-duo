@@ -335,10 +335,12 @@ export default function piDuo(pi: ExtensionAPI) {
   // opening another Pi session in the same cwd must not enable Duo behavior.
   let foregroundDuoActive = false;
   let reviewIndicatorPhase:
+    | "collaborating"
     | "working"
     | "waiting"
     | "complete"
     | "failed"
+    | "collaboration-failed"
     | "clear" = "clear";
   let reviewIndicatorDetail = "";
   let reviewIndicatorStartedAt = 0;
@@ -366,7 +368,8 @@ export default function piDuo(pi: ExtensionAPI) {
     }
     const frames = ["◐", "◓", "◑", "◒"];
     const icon =
-      reviewIndicatorPhase === "working"
+      reviewIndicatorPhase === "working" ||
+      reviewIndicatorPhase === "collaborating"
         ? frames[reviewIndicatorFrame++ % frames.length]
         : reviewIndicatorPhase === "waiting"
           ? "↔"
@@ -374,13 +377,17 @@ export default function piDuo(pi: ExtensionAPI) {
             ? "✓"
             : "⚠";
     const label =
-      reviewIndicatorPhase === "working"
+      reviewIndicatorPhase === "collaborating"
+        ? "Tony 正在后台协作"
+        : reviewIndicatorPhase === "working"
         ? "Tony 正在后台审查"
         : reviewIndicatorPhase === "waiting"
           ? "Tony 已提出修改，等待 Austin"
           : reviewIndicatorPhase === "complete"
             ? "Tony 最终审查已完成"
-            : "Tony 审查失败或被中断";
+            : reviewIndicatorPhase === "collaboration-failed"
+              ? "Tony 协作不可用，已降级为单 Agent"
+              : "Tony 审查失败或被中断";
     const elapsed = reviewIndicatorStartedAt
       ? elapsedText(reviewIndicatorStartedAt)
       : "—";
@@ -399,27 +406,43 @@ export default function piDuo(pi: ExtensionAPI) {
         `模型  ${austinModel} → ${tonyModel}`,
         `交谈  Austin → Tony ${austinPeerMessages} · Tony → Austin ${tonyPeerMessages}`,
         `进度  用户回合 ${turn || "—"} · 已用时 ${elapsed}${reviewIndicatorDetail ? ` · ${reviewIndicatorDetail}` : ""}`,
-        reviewIndicatorPhase === "working"
+        reviewIndicatorPhase === "collaborating"
+          ? "提示  Pi 提示符返回不代表协作结束；Tony 完成后会自动唤醒 Austin"
+          : reviewIndicatorPhase === "working"
           ? "提示  Pi 提示符返回不代表结束；Tony 完成后会自动唤醒 Austin"
           : reviewIndicatorPhase === "waiting"
             ? "提示  已退回 EXECUTE 阶段；Austin 修复后请调用 duo_checkpoint(action='ready_for_verification') 重新送验"
             : reviewIndicatorPhase === "complete"
               ? "提示  review 已 reported；可以提交最终的双模型结论"
-              : "提示  不得声称已通过 Tony 复验；请检查错误或重新开始审查",
+              : reviewIndicatorPhase === "collaboration-failed"
+                ? "提示  当前回合由 Austin 单独继续；不要声称已获得 Tony 协作结论"
+                : "提示  不得声称已通过 Tony 复验；请检查错误或重新开始审查",
       ],
       { placement: "belowEditor" },
     );
   };
 
   const setReviewIndicator = (
-    phase: "working" | "waiting" | "complete" | "failed" | "clear",
+    phase:
+      | "collaborating"
+      | "working"
+      | "waiting"
+      | "complete"
+      | "failed"
+      | "collaboration-failed"
+      | "clear",
     detail?: string,
   ) => {
     const wasActive =
-      reviewIndicatorPhase === "working" || reviewIndicatorPhase === "waiting";
+      reviewIndicatorPhase === "collaborating" ||
+      reviewIndicatorPhase === "working" ||
+      reviewIndicatorPhase === "waiting";
     reviewIndicatorPhase = phase;
     reviewIndicatorDetail = detail ?? "";
-    if ((phase === "working" || phase === "waiting") && !wasActive)
+    if (
+      (phase === "collaborating" || phase === "working" || phase === "waiting") &&
+      !wasActive
+    )
       reviewIndicatorStartedAt = Date.now();
     if (phase === "clear") reviewIndicatorStartedAt = 0;
     if (reviewIndicatorTimer) {
@@ -427,7 +450,7 @@ export default function piDuo(pi: ExtensionAPI) {
       reviewIndicatorTimer = undefined;
     }
     renderReviewIndicator();
-    if (phase === "working") {
+    if (phase === "collaborating" || phase === "working") {
       reviewIndicatorTimer = setInterval(renderReviewIndicator, 800);
       reviewIndicatorTimer.unref?.();
     }
@@ -717,7 +740,7 @@ export default function piDuo(pi: ExtensionAPI) {
     });
     austinPeerMessages++;
 
-    await store.update((draft) => {
+    const state = await store.update((draft) => {
       if (!draft.collaboration) {
         draft.collaboration = {
           userTurn: guard.turn,
@@ -763,7 +786,12 @@ export default function piDuo(pi: ExtensionAPI) {
       );
       return `High-priority message saved in Tony's persistent context and audit log without triggering another turn. ${blocked?.reason}`;
     }
-    setReviewIndicator("working", "正在检查 Austin 的更新");
+    setReviewIndicator(
+      state.collaboration?.phase === "verify" ? "working" : "collaborating",
+      state.collaboration?.phase === "verify"
+        ? "正在检查 Austin 的更新"
+        : "正在处理 Austin 的协作消息",
+    );
     tonyMustYield = false;
     const sentBefore = tonySentSequence;
     dispatchControlPlaneTask(
@@ -1699,7 +1727,7 @@ export default function piDuo(pi: ExtensionAPI) {
       .then(async () => {
         if (!isCurrentGeneration(generation) || !tony) return;
         const activeTony = tony;
-        setReviewIndicator("working", "Tony 正在独立探索");
+        setReviewIndicator("collaborating", "Tony 正在独立探索");
         // A followUp sent while Tony is streaming is only queued; its promise
         // resolves before that future turn finishes. Wait for the current turn
         // to become idle, then start this collaboration as its own attributable turn.
@@ -1723,6 +1751,7 @@ export default function piDuo(pi: ExtensionAPI) {
             if (store) {
               await degradeCollaborationTurn(store, userTurn);
             }
+            setReviewIndicator("collaboration-failed", "Tony 协作异常，已降级");
             sendMessageSafely(
               {
                 customType: "pi-duo-peer",
@@ -1742,6 +1771,7 @@ export default function piDuo(pi: ExtensionAPI) {
               if (store) {
                 await degradeCollaborationTurn(store, userTurn);
               }
+              setReviewIndicator("collaboration-failed", "Tony 未提供可用协作结论，已降级");
 
               sendMessageSafely(
                 {
@@ -1767,6 +1797,7 @@ export default function piDuo(pi: ExtensionAPI) {
         if (store) {
           await degradeCollaborationTurn(store, userTurn);
         }
+        setReviewIndicator("collaboration-failed", "Tony 协作异常，已降级");
         sendMessageSafely(
           {
             customType: "pi-duo-peer",
@@ -2078,6 +2109,7 @@ export default function piDuo(pi: ExtensionAPI) {
         queueMicrotask(() => queueTonyCollaborationTask(event.text, userTurn));
       } catch (error) {
         await degradeCollaborationTurn(currentStore, userTurn);
+        setReviewIndicator("collaboration-failed", "Tony 无法启动，已降级");
         ctx.ui.notify(
           `pi-duo could not dispatch Tony: ${
             error instanceof Error ? error.message : String(error)

@@ -575,6 +575,60 @@ test("Execution Gate constrains transferable Tony owner but preserves Tony scrat
   }
 });
 
+test("EXPLORE collaboration indicator does not use review wording", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-collaboration-indicator-test-"));
+  try {
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+    await store.update((draft) => { draft.agents.austin.sessionId = "mock-session-id"; });
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const statuses: Array<string | undefined> = [];
+    const api = {
+      registerTool() {},
+      registerCommand() {},
+      registerMessageRenderer() {},
+      sendMessage() {},
+      on(name: string, handler: any) {
+        if (!events.has(name)) events.set(name, []);
+        events.get(name)!.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+    piDuo(api);
+    for (const handler of events.get("session_start") || []) {
+      await handler({}, {
+        cwd,
+        sessionManager: { getSessionId: () => "mock-session-id" },
+        modelRegistry: { find: () => undefined },
+        ui: {
+          notify: () => {},
+          setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+          setWidget: () => {},
+        },
+      });
+    }
+    (api as any).__registerTonyTools({ registerTool() {}, on() {} }, 1, {
+      isStreaming: false,
+      waitForIdle: async () => {},
+      sendCustomMessage: async () => {},
+      messages: [],
+    });
+    for (const handler of events.get("input") || []) {
+      await handler(
+        { text: "explore a fix", source: "user" },
+        { cwd, modelRegistry: { find: () => undefined }, ui: { notify: () => {} } },
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(statuses.some((status) => status?.includes("Tony 正在后台协作")));
+    assert.ok(statuses.every((status) => !status?.includes("审查")));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("verification queue fails a pending review when Tony disappears after send", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-review-race-test-"));
   try {
@@ -820,6 +874,7 @@ test("ensureTony failure initializes new turn state in explore and degrades grac
 
     const events = new Map<string, Array<(...args: any[]) => any>>();
     const sentMessages: any[] = [];
+    const statuses: Array<string | undefined> = [];
     const api = {
       registerTool() {},
       registerCommand() {},
@@ -840,7 +895,11 @@ test("ensureTony failure initializes new turn state in explore and degrades grac
         cwd,
         sessionManager: { getSessionId: () => "mock-session-id" },
         modelRegistry: { find: () => undefined },
-        ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+        ui: {
+          notify: () => {},
+          setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+          setWidget: () => {},
+        },
       });
     }
 
@@ -870,6 +929,7 @@ test("ensureTony failure initializes new turn state in explore and degrades grac
     );
     assert.ok(unavailableNotice);
     assert.deepEqual(unavailableNotice.opts, { triggerTurn: true, deliverAs: "steer" });
+    assert.ok(statuses.some((status) => status?.includes("协作不可用，已降级为单 Agent")));
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
