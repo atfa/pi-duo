@@ -12,11 +12,11 @@
 <p align="center">
   <a href="https://github.com/atfa/pi-duo"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-atfa%2Fpi--duo-181717?logo=github"></a>
   <img alt="Pi" src="https://img.shields.io/badge/Pi-%E2%89%A5%200.85.1-7C3AED">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.3.1-00C2A8">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.3.2-00C2A8">
   <img alt="Tests" src="https://img.shields.io/badge/tests-passing-22C55E">
 </p>
 
-> **0.3.1 提示**：pi-duo 强化了 **“先协作、后执行、最后验证”** 的状态机规则：消息 `kind` 纯语义化、生命周期严格由控制面动作原子驱动、杜绝死锁与空响应异常。
+> **0.3.2 提示**：pi-duo 落地了完整的 **Execution Gate 与验证回退** 状态机规则：仅 `EXECUTE` 阶段允许 Austin 修改项目文件；`VERIFY` 阶段工作区完全冻结；`COMPLETE` 后修改文件必须显式 `reopen`；Tony `reviewFinding` 自动回退至 `EXECUTE` 并清除待决 review；旧 user turn 异步任务绝不污染新回合。
 
 ## 为什么需要 pi-duo？
 
@@ -392,9 +392,19 @@ NODE
   - `question`：❓ 关键提问
   - `decision`：📋 决策同步
 - `reviewComplete`：仅 Tony 在验收阶段使用；只有完成对当前交付物的独立验证后才设为 `true`。控制面会自动原子完成 `VERIFY → COMPLETE` 跃迁并唤醒 Austin；Tony 不需要且不能在 `reviewComplete` 后调用 `duo_checkpoint(action="complete")`。
-- `reviewFinding`：仅 Tony 在验收阶段使用；发现需要 Austin 修改的问题时设为 `true`，强制唤醒 Austin，但保持 review 挂起。
+- `reviewFinding`：仅 Tony 在验收阶段使用；发现需要 Austin 修改的问题时设为 `true`。控制面会自动将生命周期退回 `EXECUTE` 阶段，并清除活跃的待决 review。Austin 修复问题后重新调用 `duo_checkpoint(action="ready_for_verification")` 开启新的独立复验。
 
-> **注意**：`kind` 仅用于消息语义、审计和 UI 展示，不改变 collaboration phase 或 review lifecycle。
+> **注意**：`kind` 仅用于消息语义、审计和 UI 展示，不直接改变 collaboration phase 或 review lifecycle。阶段转换由 `duo_plan(commit)`、`duo_checkpoint` 和带 `reviewComplete`/`reviewFinding` 的控制面操作完成。
+
+### 统一执行门禁 (Execution Gate)
+
+项目工作区的修改受协作阶段严格控制：
+
+- **Only EXECUTE permits Austin to modify project files in normal collaboration mode.** 在正常协作模式下，仅 `EXECUTE` 阶段允许 Austin 修改项目文件；`EXPLORE` 与 `CONVERGE` 阶段的修改会被拦截。
+- **VERIFY freezes the project workspace while Tony independently verifies the deliverable.** 在 `VERIFY` 阶段，交付物进入冻结状态由 Tony 进行独立验收，禁止修改项目文件。
+- **After COMPLETE, Austin must explicitly reopen the collaboration before changing verified project files.** 在 `COMPLETE` 阶段，交付物属于已验证的完成状态；Austin 若需要修改项目文件，必须显式调用 `duo_checkpoint(action="reopen")` 退回 `EXECUTE`。
+- **Tony reviewFinding returns the collaboration to EXECUTE. Austin fixes the issues and starts a fresh verification checkpoint.** 当 Tony 发现缺陷并提交 `reviewFinding=true` 时，状态机自动退回 `EXECUTE` 阶段并解除写入限制；Austin 修复后重新发起 `ready_for_verification`。
+- **Degraded mode bypass**：若 Tony 启动失败或异常导致 `collaboration.degraded === true`，Execution Gate 会对 Austin 放行，保证单 Agent 模式不会死锁。
 
 `important` 和 `decision` 可以使用保留槽，并在总预算耗尽后进入 deferred 持久化槽。
 

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  applyReviewFinding,
   applyReviewReported,
   blocksDuoRestart,
   canCompleteReview,
@@ -13,6 +14,7 @@ import {
   collaborationReadyToConverge,
   completionGateNotice,
   controlPlaneDelivery,
+  degradeCollaborationTurn,
   dispatchControlPlaneTask,
   formatKindPrefix,
   isBlockedByFirstSyncBarrier,
@@ -29,6 +31,7 @@ import {
   validateReadyForVerification,
   validateReopen,
   workspaceHandoffRecipient,
+  workspaceMutationBlockReason,
 } from "../src/coordinator.js";
 import { DEFAULT_CONFIG, DuoStore } from "../src/store.js";
 
@@ -815,5 +818,186 @@ test("applyReviewReported atomically transitions review and collaboration state"
   delete (noReview as any).review;
   assert.equal(applyReviewReported(noReview as any, 1), false);
 });
+
+test("workspace mutation gate follows collaboration lifecycle", () => {
+  const base = {
+    userTurn: 1,
+    austinContributed: true,
+    tonyContributed: true,
+    tonyInitialContribution: true,
+    contested: false,
+    planRevision: 1,
+  };
+
+  // EXPLORE without Tony's initial contribution
+  assert.match(
+    workspaceMutationBlockReason("austin", {
+      ...base,
+      phase: "explore",
+      tonyInitialContribution: false,
+    }) ?? "",
+    /First Collaboration Barrier/i,
+  );
+
+  // EXPLORE with Tony's initial contribution
+  assert.match(
+    workspaceMutationBlockReason("austin", {
+      ...base,
+      phase: "explore",
+    }) ?? "",
+    /EXPLORE/i,
+  );
+
+  // CONVERGE
+  assert.match(
+    workspaceMutationBlockReason("austin", {
+      ...base,
+      phase: "converge",
+    }) ?? "",
+    /CONVERGE/i,
+  );
+
+  // EXECUTE (allowed)
+  assert.equal(
+    workspaceMutationBlockReason("austin", {
+      ...base,
+      phase: "execute",
+    }),
+    undefined,
+  );
+
+  // VERIFY
+  assert.match(
+    workspaceMutationBlockReason("austin", {
+      ...base,
+      phase: "verify",
+    }) ?? "",
+    /verification/i,
+  );
+
+  // COMPLETE
+  assert.match(
+    workspaceMutationBlockReason("austin", {
+      ...base,
+      phase: "complete",
+    }) ?? "",
+    /reopen/i,
+  );
+
+  // Degraded mode bypasses all blocks
+  assert.equal(
+    workspaceMutationBlockReason("austin", {
+      ...base,
+      phase: "explore",
+      degraded: true,
+    }),
+    undefined,
+  );
+  assert.equal(
+    workspaceMutationBlockReason("austin", {
+      ...base,
+      phase: "converge",
+      degraded: true,
+    }),
+    undefined,
+  );
+  assert.equal(
+    workspaceMutationBlockReason("austin", {
+      ...base,
+      phase: "verify",
+      degraded: true,
+    }),
+    undefined,
+  );
+  assert.equal(
+    workspaceMutationBlockReason("austin", {
+      ...base,
+      phase: "complete",
+      degraded: true,
+    }),
+    undefined,
+  );
+
+  // Non-Austin actor is not blocked by this gate
+  assert.equal(
+    workspaceMutationBlockReason("tony", {
+      ...base,
+      phase: "explore",
+    }),
+    undefined,
+  );
+
+  // Undefined collaboration
+  assert.equal(workspaceMutationBlockReason("austin", undefined), undefined);
+});
+
+test("applyReviewFinding transitions VERIFY to EXECUTE and clears review", () => {
+  const state: any = {
+    collaboration: {
+      userTurn: 1,
+      phase: "verify",
+    },
+    review: {
+      status: "pending",
+      userTurn: 1,
+    },
+  };
+
+  const ok = applyReviewFinding(state);
+  assert.equal(ok, true);
+  assert.equal(state.collaboration.phase, "execute");
+  assert.equal(state.review, undefined);
+
+  // Fails if phase is not verify
+  state.collaboration.phase = "execute";
+  state.review = { status: "pending", userTurn: 1 };
+  assert.equal(applyReviewFinding(state), false);
+
+  // Fails if review is not pending
+  state.collaboration.phase = "verify";
+  state.review = { status: "reported", userTurn: 1 };
+  assert.equal(applyReviewFinding(state), false);
+});
+
+test("degradeCollaborationTurn protects against stale userTurn pollution", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-degrade-test-"));
+  try {
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+    await store.update((draft) => {
+      draft.collaboration = {
+        userTurn: 2,
+        phase: "explore",
+        austinContributed: false,
+        tonyContributed: false,
+        tonyInitialContribution: false,
+        contested: false,
+        planRevision: 0,
+      };
+    });
+
+    // 1. Stale error from turn 1 cannot degrade turn 2
+    const staleResult = await degradeCollaborationTurn(store, 1);
+    assert.equal(staleResult, false);
+    let state = await store.readState();
+    assert.equal(state?.collaboration?.userTurn, 2);
+    assert.equal(state?.collaboration?.degraded, undefined);
+    assert.equal(state?.collaboration?.tonyInitialContribution, false);
+
+    // 2. Error matching current turn 2 degrades turn 2
+    const currentResult = await degradeCollaborationTurn(store, 2);
+    assert.equal(currentResult, true);
+    state = await store.readState();
+    assert.equal(state?.collaboration?.userTurn, 2);
+    assert.equal(state?.collaboration?.degraded, true);
+    assert.equal(state?.collaboration?.tonyInitialContribution, true);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 
 

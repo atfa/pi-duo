@@ -95,6 +95,55 @@ export function isBlockedByFirstSyncBarrier(
   );
 }
 
+export function workspaceMutationBlockReason(
+  actor: AgentId,
+  collaboration?: DuoCollaborationState,
+): string | undefined {
+  if (actor !== "austin" || !collaboration) {
+    return undefined;
+  }
+
+  if (collaboration.degraded) {
+    return undefined;
+  }
+
+  switch (collaboration.phase) {
+    case "explore":
+      if (!collaboration.tonyInitialContribution) {
+        return (
+          "First Collaboration Barrier: Austin must wait for Tony's " +
+          "initial independent contribution before modifying project files."
+        );
+      }
+
+      return (
+        "Collaboration is still in EXPLORE. Austin must contribute to " +
+        "the shared approach and reach CONVERGE before implementation."
+      );
+
+    case "converge":
+      return (
+        'Collaboration is in CONVERGE. Commit the shared working plan ' +
+        'with duo_plan(action="commit") before modifying project files.'
+      );
+
+    case "execute":
+      return undefined;
+
+    case "verify":
+      return (
+        "The deliverable is currently under independent verification. " +
+        "Project files must not change while Tony is verifying it."
+      );
+
+    case "complete":
+      return (
+        'The verified deliverable is COMPLETE. Use ' +
+        'duo_checkpoint(action="reopen") before modifying project files.'
+      );
+  }
+}
+
 export function collaborationReadyToConverge(
   collaboration?: DuoCollaborationState,
 ): boolean {
@@ -301,6 +350,45 @@ export function applyReviewReported(
     draft.collaboration.phase = "complete";
   }
   return true;
+}
+
+export function applyReviewFinding(draft: DuoState): boolean {
+  if (
+    draft.collaboration?.phase === "verify" &&
+    draft.review?.status === "pending"
+  ) {
+    draft.collaboration.phase = "execute";
+    delete draft.review;
+    return true;
+  }
+  return false;
+}
+
+export async function degradeCollaborationTurn(
+  store: DuoStore,
+  userTurn: number,
+): Promise<boolean> {
+  const current = await store.readState();
+
+  if (
+    !current?.collaboration ||
+    current.collaboration.userTurn !== userTurn
+  ) {
+    return false;
+  }
+
+  try {
+    await store.update((draft) => {
+      if (draft.collaboration?.userTurn === userTurn) {
+        draft.collaboration.degraded = true;
+        draft.collaboration.tonyInitialContribution = true;
+      }
+    }, current.revision);
+
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function canCompleteReview(

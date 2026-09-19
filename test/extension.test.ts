@@ -379,3 +379,317 @@ test("stop tony command unblocks First Collaboration Barrier in EXPLORE", async 
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test("Execution Gate blocks Austin project writes in VERIFY and COMPLETE, allows after reopen", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-gate-test-"));
+  try {
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+    await store.update((draft) => {
+      draft.agents.austin.sessionId = "mock-session-id";
+      draft.collaboration = {
+        userTurn: 1,
+        phase: "verify",
+        austinContributed: true,
+        tonyContributed: true,
+        tonyInitialContribution: true,
+        contested: false,
+        planRevision: 1,
+      };
+      draft.review = {
+        userTurn: 1,
+        status: "pending",
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+    });
+
+    const tools = new Map<string, (id: string, params: any) => Promise<any>>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const api = {
+      registerTool(tool: { name: string; execute: any }) {
+        tools.set(tool.name, tool.execute);
+      },
+      registerCommand() {},
+      registerMessageRenderer() {},
+      sendMessage() {},
+      on(name: string, handler: any) {
+        if (!events.has(name)) events.set(name, []);
+        events.get(name)!.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+
+    piDuo(api);
+
+    for (const handler of events.get("session_start") || []) {
+      await handler({}, {
+        cwd,
+        sessionManager: { getSessionId: () => "mock-session-id" },
+        modelRegistry: { find: () => undefined },
+        ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+      });
+    }
+
+    const [toolCallHandler] = events.get("tool_call") || [];
+    assert.ok(toolCallHandler);
+
+    // 1. In VERIFY: Austin project write is blocked
+    const verifyBlock = await toolCallHandler({
+      toolName: "write",
+      input: { path: "src/index.ts" },
+    });
+    assert.deepEqual(verifyBlock?.block, true);
+    assert.match(verifyBlock?.reason ?? "", /under independent verification/i);
+
+    // 2. Transition to COMPLETE
+    await store.update((draft) => {
+      draft.collaboration!.phase = "complete";
+      draft.review!.status = "reported";
+    });
+
+    // In COMPLETE: Austin project write is blocked with reopen hint
+    const completeBlock = await toolCallHandler({
+      toolName: "edit",
+      input: { path: "src/index.ts" },
+    });
+    assert.deepEqual(completeBlock?.block, true);
+    assert.match(completeBlock?.reason ?? "", /reopen/i);
+
+    // 3. Austin calls duo_checkpoint reopen -> returns to EXECUTE
+    const checkpointExecute = tools.get("duo_checkpoint");
+    assert.ok(checkpointExecute);
+    const reopenRes = await checkpointExecute("1", { action: "reopen" });
+    assert.match(reopenRes.content[0].text, /reopened into EXECUTE phase/i);
+
+    // 4. In EXECUTE: Austin project write is allowed
+    const executeAllowed = await toolCallHandler({
+      toolName: "write",
+      input: { path: "src/index.ts" },
+    });
+    assert.equal(executeAllowed, undefined);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("Tony reviewFinding returns collaboration to EXECUTE, clears review, and allows fresh verification", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-finding-test-"));
+  try {
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+    await store.update((draft) => {
+      draft.agents.austin.sessionId = "mock-session-id";
+    });
+
+    const tools = new Map<string, (id: string, params: any) => Promise<any>>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const sentMessages: any[] = [];
+    const api = {
+      registerTool(tool: { name: string; execute: any }) {
+        tools.set(tool.name, tool.execute);
+      },
+      registerCommand() {},
+      registerMessageRenderer() {},
+      sendMessage(msg: any, opts: any) {
+        sentMessages.push({ msg, opts });
+      },
+      on(name: string, handler: any) {
+        if (!events.has(name)) events.set(name, []);
+        events.get(name)!.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+
+    piDuo(api);
+
+    for (const handler of events.get("session_start") || []) {
+      await handler({}, {
+        cwd,
+        sessionManager: { getSessionId: () => "mock-session-id" },
+        modelRegistry: { find: () => undefined },
+        ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+      });
+    }
+
+    // 1. Establish user turn 1 via input handler
+    for (const handler of events.get("input") || []) {
+      await handler(
+        { text: "implement feature X", source: "user" },
+        {
+          cwd,
+          modelRegistry: { find: () => undefined },
+          ui: { notify: () => {} },
+        },
+      );
+    }
+
+    // 2. Set up bilateral contributions and move to EXECUTE
+    await store.update((draft) => {
+      draft.collaboration!.tonyContributed = true;
+      draft.collaboration!.tonyInitialContribution = true;
+      draft.collaboration!.austinContributed = true;
+      draft.collaboration!.phase = "execute";
+    });
+
+    // 3. Austin calls ready_for_verification -> phase becomes VERIFY with pending review
+    const checkpointExecute = tools.get("duo_checkpoint");
+    assert.ok(checkpointExecute);
+    const readyRes1 = await checkpointExecute("1", {
+      action: "ready_for_verification",
+      summary: "First deliverable ready",
+    });
+    assert.match(readyRes1.content[0].text, /ready for independent verification/i);
+
+    let state = await store.readState();
+    assert.equal(state?.collaboration?.phase, "verify");
+    assert.equal(state?.review?.status, "pending");
+    assert.equal(state?.review?.userTurn, 1);
+
+    // Register Tony's tools for turn 1
+    const tonyTools = new Map<string, (id: string, params: any) => Promise<any>>();
+    const tonyApi = {
+      registerTool(tool: { name: string; execute: any }) {
+        tonyTools.set(tool.name, tool.execute);
+      },
+      on() {},
+    } as unknown as ExtensionAPI;
+    (api as any).__registerTonyTools(tonyApi, 1);
+
+    const tonySend = tonyTools.get("duo_send");
+    assert.ok(tonySend);
+
+    // 4. Tony sends reviewFinding
+    const sendRes = await tonySend("2", {
+      reviewFinding: true,
+      message: "Found bug in auth validation",
+      kind: "finding",
+    });
+    assert.match(sendRes.content[0].text, /returned to EXECUTE/i);
+
+    // 5. Verify state: phase is execute, review is deleted
+    state = await store.readState();
+    assert.equal(state?.collaboration?.phase, "execute");
+    assert.equal(state?.review, undefined);
+
+    // Austin was steered with verification finding message
+    const findingNotice = sentMessages.find((m) =>
+      m.msg.content.includes("Verification found actionable defects"),
+    );
+    assert.ok(findingNotice);
+    assert.deepEqual(findingNotice.opts, { triggerTurn: true, deliverAs: "steer" });
+
+    // 6. Austin project write is allowed in EXECUTE
+    const [toolCallHandler] = events.get("tool_call") || [];
+    assert.ok(toolCallHandler);
+    const writeAllowed = await toolCallHandler({
+      toolName: "write",
+      input: { path: "src/auth.ts" },
+    });
+    assert.equal(writeAllowed, undefined);
+
+    // 7. Austin fixes defects and calls ready_for_verification again
+    const readyRes2 = await checkpointExecute("3", {
+      action: "ready_for_verification",
+      summary: "Fixed auth validation bug",
+    });
+    assert.match(readyRes2.content[0].text, /ready for independent verification/i);
+
+    state = await store.readState();
+    assert.equal(state?.collaboration?.phase, "verify");
+    assert.equal(state?.review?.status, "pending");
+    assert.equal(state?.review?.userTurn, 1);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("ensureTony failure initializes new turn state in explore and degrades gracefully", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-ensure-fail-test-"));
+  try {
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+    // Old collaboration from turn 1 was complete
+    await store.update((draft) => {
+      draft.agents.austin.sessionId = "mock-session-id";
+      draft.collaboration = {
+        userTurn: 1,
+        phase: "complete",
+        austinContributed: true,
+        tonyContributed: true,
+        tonyInitialContribution: true,
+        contested: false,
+        planRevision: 1,
+      };
+      draft.review = {
+        userTurn: 1,
+        status: "reported",
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+    });
+
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const sentMessages: any[] = [];
+    const api = {
+      registerTool() {},
+      registerCommand() {},
+      registerMessageRenderer() {},
+      sendMessage(msg: any, opts: any) {
+        sentMessages.push({ msg, opts });
+      },
+      on(name: string, handler: any) {
+        if (!events.has(name)) events.set(name, []);
+        events.get(name)!.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+
+    piDuo(api);
+
+    for (const handler of events.get("session_start") || []) {
+      await handler({}, {
+        cwd,
+        sessionManager: { getSessionId: () => "mock-session-id" },
+        modelRegistry: { find: () => undefined },
+        ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+      });
+    }
+
+    // User inputs new task for turn 2, but ensureTony fails (modelRegistry.find returns undefined)
+    for (const handler of events.get("input") || []) {
+      await handler(
+        { text: "implement feature Y", source: "user" },
+        {
+          cwd,
+          modelRegistry: { find: () => undefined },
+          ui: { notify: () => {} },
+        },
+      );
+    }
+
+    const state = await store.readState();
+    // Turn 2 must have its own state, in explore, degraded, not turn 1 complete!
+    assert.equal(state?.collaboration?.userTurn, 2);
+    assert.equal(state?.collaboration?.phase, "explore");
+    assert.equal(state?.collaboration?.degraded, true);
+    assert.equal(state?.collaboration?.tonyInitialContribution, true);
+    assert.equal(state?.review, undefined);
+
+    // Austin was steered with Tony unavailable notice
+    const unavailableNotice = sentMessages.find((m) =>
+      m.msg.content.includes("[Tony unavailable]"),
+    );
+    assert.ok(unavailableNotice);
+    assert.deepEqual(unavailableNotice.opts, { triggerTurn: true, deliverAs: "steer" });
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+

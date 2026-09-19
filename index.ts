@@ -13,6 +13,7 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
+  applyReviewFinding,
   applyReviewReported,
   blocksDuoRestart,
   canCompleteReview,
@@ -22,6 +23,7 @@ import {
   collaborationReadyToConverge,
   controlPlaneDelivery,
   completionGateNotice,
+  degradeCollaborationTurn,
   dispatchControlPlaneTask,
   formatKindPrefix,
   isBlockedByFirstSyncBarrier,
@@ -38,6 +40,7 @@ import {
   validateReadyForVerification,
   validateReopen,
   workspaceHandoffRecipient,
+  workspaceMutationBlockReason,
 } from "./src/coordinator.js";
 import {
   DuoStore,
@@ -399,7 +402,7 @@ export default function piDuo(pi: ExtensionAPI) {
         reviewIndicatorPhase === "working"
           ? "提示  Pi 提示符返回不代表结束；Tony 完成后会自动唤醒 Austin"
           : reviewIndicatorPhase === "waiting"
-            ? "提示  review 仍为 pending；Austin 修复后将自动重新交给 Tony"
+            ? "提示  已退回 EXECUTE 阶段；Austin 修复后请调用 duo_checkpoint(action='ready_for_verification') 重新送验"
             : reviewIndicatorPhase === "complete"
               ? "提示  review 已 reported；可以提交最终的双模型结论"
               : "提示  不得声称已通过 Tony 复验；请检查错误或重新开始审查",
@@ -979,10 +982,24 @@ export default function piDuo(pi: ExtensionAPI) {
           if (tonyShouldYieldAfterSend(response)) {
             tonyMustYield = true;
           }
-          setReviewIndicator("waiting", "Tony 已提出修改要求");
+          await store.update((draft) => {
+            applyReviewFinding(draft);
+          });
+          setReviewIndicator("waiting", "Tony 发现缺陷，已退回 EXECUTE 阶段");
+          sendMessageSafely(
+            {
+              customType: "pi-duo-peer",
+              content:
+                "[Tony verification finding]\n" +
+                "Verification found actionable defects. The collaboration returned to EXECUTE. " +
+                "Fix the reported issues, then call duo_checkpoint(action=\"ready_for_verification\") again for a fresh independent verification.",
+              display: true,
+            },
+            { triggerTurn: true, deliverAs: "steer" },
+          );
           return result(
             tonyMustYield
-              ? `${response} Review remains pending for Austin's fixes and Tony's final verification. End this turn now.`
+              ? `${response} Verification found actionable defects; collaboration returned to EXECUTE. End this turn now; wait for Austin's fixes.`
               : response,
           );
         }
@@ -1476,11 +1493,14 @@ export default function piDuo(pi: ExtensionAPI) {
       if (!mutating || !store) return;
       const latestConfig = await store.readConfig();
       const state = await enforceWritePolicy(store, latestConfig);
-      if (isBlockedByFirstSyncBarrier(actor, state?.collaboration)) {
+      const phaseBlockReason = workspaceMutationBlockReason(
+        actor,
+        state?.collaboration,
+      );
+      if (phaseBlockReason) {
         return {
           block: true,
-          reason:
-            "First Collaboration Barrier: In the EXPLORE phase, Austin must wait for Tony's initial independent contribution before modifying project files. Send ideas or exchange evidence with duo_send first, or wait for Tony.",
+          reason: phaseBlockReason,
         };
       }
       if (
@@ -1694,12 +1714,7 @@ export default function piDuo(pi: ExtensionAPI) {
           const outcome = latestAssistantOutcome(activeTony);
           if (outcome?.error) {
             if (store) {
-              await store.update((draft) => {
-                if (draft.collaboration) {
-                  draft.collaboration.degraded = true;
-                  draft.collaboration.tonyInitialContribution = true;
-                }
-              });
+              await degradeCollaborationTurn(store, userTurn);
             }
             sendMessageSafely(
               {
@@ -1718,15 +1733,7 @@ export default function piDuo(pi: ExtensionAPI) {
               await sendToAustin(final, "important", true, false, "proposal");
             } else {
               if (store) {
-                await store.update((draft) => {
-                  if (
-                    draft.collaboration &&
-                    draft.collaboration.userTurn === userTurn
-                  ) {
-                    draft.collaboration.degraded = true;
-                    draft.collaboration.tonyInitialContribution = true;
-                  }
-                });
+                await degradeCollaborationTurn(store, userTurn);
               }
 
               sendMessageSafely(
@@ -1751,12 +1758,7 @@ export default function piDuo(pi: ExtensionAPI) {
         if (activeTonyUserTurn === userTurn) activeTonyUserTurn = undefined;
         const errorText = error instanceof Error ? error.message : String(error);
         if (store) {
-          await store.update((draft) => {
-            if (draft.collaboration) {
-              draft.collaboration.degraded = true;
-              draft.collaboration.tonyInitialContribution = true;
-            }
-          });
+          await degradeCollaborationTurn(store, userTurn);
         }
         sendMessageSafely(
           {
@@ -1861,6 +1863,12 @@ export default function piDuo(pi: ExtensionAPI) {
 
   registerTools(pi, "austin");
   installWriteGuard(pi, "austin");
+
+  (pi as any).__registerTonyTools = (tonyApi: ExtensionAPI, activeTurn?: number) => {
+    if (activeTurn !== undefined) activeTonyUserTurn = activeTurn;
+    registerTools(tonyApi, "tony");
+    installWriteGuard(tonyApi, "tony");
+  };
 
   pi.registerMessageRenderer("pi-duo-peer", (message, _options, theme) => {
     const details = message.details as PeerMessage | undefined;
@@ -2005,32 +2013,41 @@ export default function piDuo(pi: ExtensionAPI) {
         : undefined,
     );
     if (foregroundDuoActive && state?.status === "active" && config.autoDispatch) {
+      await currentStore.update((draft) => {
+        draft.collaboration = {
+          userTurn,
+          phase: "explore",
+          austinContributed: false,
+          tonyContributed: false,
+          tonyInitialContribution: false,
+          contested: false,
+          planRevision: 0,
+        };
+        delete draft.review;
+      });
+
       try {
         await ensureTony(ctx.cwd, ctx.modelRegistry);
-        await currentStore.update((draft) => {
-          draft.collaboration = {
-            userTurn,
-            phase: "explore",
-            austinContributed: false,
-            tonyContributed: false,
-            tonyInitialContribution: false,
-            contested: false,
-            planRevision: 0,
-          };
-          delete draft.review;
-        });
         setReviewIndicator("clear");
         queueMicrotask(() => queueTonyCollaborationTask(event.text, userTurn));
       } catch (error) {
-        await currentStore.update((draft) => {
-          if (draft.collaboration) {
-            draft.collaboration.degraded = true;
-            draft.collaboration.tonyInitialContribution = true;
-          }
-        });
+        await degradeCollaborationTurn(currentStore, userTurn);
         ctx.ui.notify(
-          `pi-duo could not dispatch Tony: ${error instanceof Error ? error.message : String(error)}`,
+          `pi-duo could not dispatch Tony: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
           "warning",
+        );
+        sendMessageSafely(
+          {
+            customType: "pi-duo-peer",
+            content:
+              "[Tony unavailable]\n" +
+              "Tony could not start for this user turn. " +
+              "Continue in degraded single-agent mode and do not claim peer verification.",
+            display: true,
+          },
+          { triggerTurn: true, deliverAs: "steer" },
         );
       }
     }
