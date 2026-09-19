@@ -884,7 +884,7 @@ test("workspace mutation gate follows collaboration lifecycle", () => {
     /reopen/i,
   );
 
-  // Degraded mode bypasses all blocks
+  // Degraded mode only unblocks Austin's planning phases.
   assert.equal(
     workspaceMutationBlockReason("austin", {
       ...base,
@@ -901,30 +901,53 @@ test("workspace mutation gate follows collaboration lifecycle", () => {
     }),
     undefined,
   );
-  assert.equal(
+  assert.match(
     workspaceMutationBlockReason("austin", {
       ...base,
       phase: "verify",
       degraded: true,
-    }),
-    undefined,
+    }) ?? "",
+    /verification/i,
   );
-  assert.equal(
+  assert.match(
     workspaceMutationBlockReason("austin", {
       ...base,
       phase: "complete",
       degraded: true,
-    }),
-    undefined,
+    }) ?? "",
+    /reopen/i,
   );
 
-  // Non-Austin actor is not blocked by this gate
-  assert.equal(
+  // A transferable Tony owner is subject to the same integration gate.
+  assert.match(
     workspaceMutationBlockReason("tony", {
       ...base,
       phase: "explore",
-    }),
+    }, "tony") ?? "",
+    /Only EXECUTE/i,
+  );
+  assert.equal(
+    workspaceMutationBlockReason("tony", {
+      ...base,
+      phase: "execute",
+    }, "tony"),
     undefined,
+  );
+  assert.match(
+    workspaceMutationBlockReason("tony", {
+      ...base,
+      phase: "verify",
+      degraded: true,
+    }, "tony") ?? "",
+    /verification/i,
+  );
+  assert.match(
+    workspaceMutationBlockReason("tony", {
+      ...base,
+      phase: "complete",
+      degraded: true,
+    }, "tony") ?? "",
+    /reopen/i,
   );
 
   // Undefined collaboration
@@ -998,6 +1021,5 @@ test("degradeCollaborationTurn protects against stale userTurn pollution", async
     await rm(cwd, { recursive: true, force: true });
   }
 });
-
 
 

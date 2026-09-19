@@ -189,14 +189,23 @@ test("duo_plan and duo_checkpoint enforce strict phase transitions", async () =>
     state = await store.readState();
     assert.equal(state?.collaboration?.phase, "execute");
 
-    // 5. Ready for verification succeeds in EXECUTE -> VERIFY
+    // 5. With Tony unavailable, no pending review can be created.
     const readyOk = await checkpointExecute("4", { action: "ready_for_verification", summary: "ready" });
-    assert.match(readyOk.content[0].text, /ready for independent verification/i);
+    assert.match(readyOk.content[0].text, /Tony is unavailable/i);
     state = await store.readState();
-    assert.equal(state?.collaboration?.phase, "verify");
-    assert.equal(state?.review?.status, "pending");
+    assert.equal(state?.collaboration?.phase, "execute");
+    assert.equal(state?.review, undefined);
 
-    // 6. Manual completion rejected while review is pending
+    // 6. Existing pending review still requires Tony's report before completion.
+    await store.update((draft) => {
+      draft.collaboration!.phase = "verify";
+      draft.review = {
+        userTurn: 1,
+        status: "pending",
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+    });
     const completeFail = await checkpointExecute("5", { action: "complete" });
     assert.match(completeFail.content[0].text, /requires a reported Tony verification/i);
 
@@ -289,10 +298,20 @@ test("duo_send with kind does not alter collaboration phase or review status", a
     assert.equal(state?.collaboration?.phase, "execute");
     assert.equal(state?.review, undefined);
 
-    // 3. Austin moves to VERIFY via duo_checkpoint
+    // 3. Existing verification state keeps duo_send phase-neutral.
     const checkpointExecute = tools.get("duo_checkpoint");
     assert.ok(checkpointExecute);
-    await checkpointExecute("3", { action: "ready_for_verification", summary: "ready" });
+    const unavailable = await checkpointExecute("3", { action: "ready_for_verification", summary: "ready" });
+    assert.match(unavailable.content[0].text, /Tony is unavailable/i);
+    await store.update((draft) => {
+      draft.collaboration!.phase = "verify";
+      draft.review = {
+        userTurn: 1,
+        status: "pending",
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+    });
     state = await store.readState();
     assert.equal(state?.collaboration?.phase, "verify");
     assert.equal(state?.review?.status, "pending");
@@ -475,6 +494,161 @@ test("Execution Gate blocks Austin project writes in VERIFY and COMPLETE, allows
   }
 });
 
+test("Execution Gate constrains transferable Tony owner but preserves Tony scratch writes", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-tony-gate-test-"));
+  try {
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+    await store.writeConfig({
+      ...(await store.readConfig()),
+      writePolicy: "transferable",
+    });
+    await store.update((draft) => {
+      draft.agents.austin.sessionId = "mock-session-id";
+      draft.workspaceOwner = "tony";
+      draft.collaboration = {
+        userTurn: 1,
+        phase: "explore",
+        austinContributed: true,
+        tonyContributed: true,
+        tonyInitialContribution: true,
+        contested: false,
+        planRevision: 1,
+      };
+    });
+
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const api = {
+      registerTool() {},
+      registerCommand() {},
+      registerMessageRenderer() {},
+      sendMessage() {},
+      on(name: string, handler: any) {
+        if (!events.has(name)) events.set(name, []);
+        events.get(name)!.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+    piDuo(api);
+    for (const handler of events.get("session_start") || []) {
+      await handler({}, {
+        cwd,
+        sessionManager: { getSessionId: () => "mock-session-id" },
+        modelRegistry: { find: () => undefined },
+        ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+      });
+    }
+
+    const tonyEvents = new Map<string, Array<(...args: any[]) => any>>();
+    (api as any).__registerTonyTools({
+      registerTool() {},
+      on(name: string, handler: any) {
+        if (!tonyEvents.has(name)) tonyEvents.set(name, []);
+        tonyEvents.get(name)!.push(handler);
+      },
+    }, 1);
+    const [guard] = tonyEvents.get("tool_call") || [];
+    assert.ok(guard);
+
+    const explore = await guard({ toolName: "write", input: { path: "src/index.ts" } });
+    assert.equal(explore?.block, true);
+    assert.match(explore?.reason ?? "", /Only EXECUTE/i);
+
+    await store.update((draft) => { draft.collaboration!.phase = "execute"; });
+    assert.equal(await guard({ toolName: "write", input: { path: "src/index.ts" } }), undefined);
+
+    await store.update((draft) => {
+      draft.collaboration!.phase = "verify";
+      draft.collaboration!.degraded = true;
+    });
+    const verify = await guard({ toolName: "write", input: { path: "src/index.ts" } });
+    assert.equal(verify?.block, true);
+    assert.match(verify?.reason ?? "", /verification/i);
+    assert.equal(
+      await guard({ toolName: "write", input: { path: path.join(store.tonyScratchDir, "check.ts") } }),
+      undefined,
+    );
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("verification queue fails a pending review when Tony disappears after send", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-review-race-test-"));
+  try {
+    const tools = new Map<string, (id: string, params: any) => Promise<any>>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const api = {
+      registerTool(tool: { name: string; execute: any }) { tools.set(tool.name, tool.execute); },
+      registerCommand() {},
+      registerMessageRenderer() {},
+      sendMessage() {},
+      on(name: string, handler: any) {
+        if (!events.has(name)) events.set(name, []);
+        events.get(name)!.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+    piDuo(api);
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+    await store.update((draft) => {
+      draft.agents.austin.sessionId = "mock-session-id";
+      draft.collaboration = {
+        userTurn: 1,
+        phase: "execute",
+        austinContributed: true,
+        tonyContributed: true,
+        tonyInitialContribution: true,
+        contested: false,
+        planRevision: 1,
+      };
+    });
+    for (const handler of events.get("session_start") || []) {
+      await handler({}, {
+        cwd,
+        sessionManager: { getSessionId: () => "mock-session-id" },
+        modelRegistry: { find: () => undefined },
+        ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+      });
+    }
+    const tonyApi = { registerTool() {}, on() {} } as unknown as ExtensionAPI;
+    const replacement = {
+      isStreaming: false,
+      waitForIdle: async () => {},
+      sendCustomMessage: async () => {},
+      messages: [],
+    };
+    const activeTony = {
+      isStreaming: false,
+      waitForIdle: async () => {},
+      sendCustomMessage: async () => {
+        (api as any).__registerTonyTools(tonyApi, 1, replacement);
+      },
+      messages: [],
+    };
+    (api as any).__registerTonyTools(tonyApi, 1, activeTony);
+    const checkpoint = tools.get("duo_checkpoint");
+    assert.ok(checkpoint);
+    await checkpoint("1", { action: "ready_for_verification" });
+
+    for (let attempts = 0; attempts < 20; attempts++) {
+      if ((await store.readState())?.review?.status === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const review = (await store.readState())?.review;
+    assert.equal(review?.status, "failed");
+    assert.match(
+      review?.error ?? "",
+      /Tony became unavailable before verification could start/,
+    );
+  } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
 test("Tony reviewFinding returns collaboration to EXECUTE, clears review, and allows fresh verification", async () => {
   const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-finding-test-"));
   try {
@@ -536,14 +710,23 @@ test("Tony reviewFinding returns collaboration to EXECUTE, clears review, and al
       draft.collaboration!.phase = "execute";
     });
 
-    // 3. Austin calls ready_for_verification -> phase becomes VERIFY with pending review
+    // 3. Model the active verification that an available Tony started.
     const checkpointExecute = tools.get("duo_checkpoint");
     assert.ok(checkpointExecute);
     const readyRes1 = await checkpointExecute("1", {
       action: "ready_for_verification",
       summary: "First deliverable ready",
     });
-    assert.match(readyRes1.content[0].text, /ready for independent verification/i);
+    assert.match(readyRes1.content[0].text, /Tony is unavailable/i);
+    await store.update((draft) => {
+      draft.collaboration!.phase = "verify";
+      draft.review = {
+        userTurn: 1,
+        status: "pending",
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+    });
 
     let state = await store.readState();
     assert.equal(state?.collaboration?.phase, "verify");
@@ -592,17 +775,16 @@ test("Tony reviewFinding returns collaboration to EXECUTE, clears review, and al
     });
     assert.equal(writeAllowed, undefined);
 
-    // 7. Austin fixes defects and calls ready_for_verification again
+    // 7. A new request is rejected cleanly until Tony is resumed.
     const readyRes2 = await checkpointExecute("3", {
       action: "ready_for_verification",
       summary: "Fixed auth validation bug",
     });
-    assert.match(readyRes2.content[0].text, /ready for independent verification/i);
+    assert.match(readyRes2.content[0].text, /Tony is unavailable/i);
 
     state = await store.readState();
-    assert.equal(state?.collaboration?.phase, "verify");
-    assert.equal(state?.review?.status, "pending");
-    assert.equal(state?.review?.userTurn, 1);
+    assert.equal(state?.collaboration?.phase, "execute");
+    assert.equal(state?.review, undefined);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -692,4 +874,3 @@ test("ensureTony failure initializes new turn state in explore and degrades grac
     await rm(cwd, { recursive: true, force: true });
   }
 });
-

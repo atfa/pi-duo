@@ -1168,6 +1168,12 @@ export default function piDuo(pi: ExtensionAPI) {
             currentState.collaboration,
           );
           if (err) return result(err, currentState);
+          if (!tony) {
+            return result(
+              "Tony is unavailable; resume Tony before requesting independent verification.",
+              currentState,
+            );
+          }
           const timestamp = new Date().toISOString();
           const state = await store.update((draft) => {
             if (!draft.collaboration) {
@@ -1496,6 +1502,7 @@ export default function piDuo(pi: ExtensionAPI) {
       const phaseBlockReason = workspaceMutationBlockReason(
         actor,
         state?.collaboration,
+        state?.workspaceOwner ?? null,
       );
       if (phaseBlockReason) {
         return {
@@ -1772,16 +1779,46 @@ export default function piDuo(pi: ExtensionAPI) {
       });
   };
 
+  const failUnavailableVerification = async (
+    userTurn: number,
+    generation: number,
+  ) => {
+    await markReviewFailed(
+      userTurn,
+      "Tony became unavailable before verification could start",
+    );
+    sendMessageSafely(
+      {
+        customType: "pi-duo-peer",
+        content:
+          "[Tony verification unavailable]\n" +
+          "Tony became unavailable before independent verification could start. " +
+          "The pending review was marked failed; resume Tony and request verification again.",
+        display: true,
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+      generation,
+    );
+  };
+
   const queueTonyVerificationTask = (summary?: string, userTurn?: number) => {
     const generation = lifecycleGeneration;
     const taskTurn = userTurn ?? guard.turn;
     tonyQueue = tonyQueue
       .then(async () => {
-        if (!isCurrentGeneration(generation) || !tony) return;
+        if (!isCurrentGeneration(generation)) return;
+        if (!tony) {
+          await failUnavailableVerification(taskTurn, generation);
+          return;
+        }
         const activeTony = tony;
         setReviewIndicator("working", "Tony 独立验证中");
         await activeTony.waitForIdle();
-        if (!isCurrentGeneration(generation) || tony !== activeTony) return;
+        if (!isCurrentGeneration(generation)) return;
+        if (tony !== activeTony) {
+          await failUnavailableVerification(taskTurn, generation);
+          return;
+        }
         tonyMustYield = false;
         activeTonyUserTurn = taskTurn;
         const sentBefore = tonySentSequence;
@@ -1794,7 +1831,11 @@ export default function piDuo(pi: ExtensionAPI) {
             },
             triggeringDelivery(false),
           );
-          if (!isCurrentGeneration(generation) || tony !== activeTony) return;
+          if (!isCurrentGeneration(generation)) return;
+          if (tony !== activeTony) {
+            await failUnavailableVerification(taskTurn, generation);
+            return;
+          }
           const outcome = latestAssistantOutcome(activeTony);
           if (outcome?.error) {
             await markReviewFailed(taskTurn, outcome.error);
@@ -1864,8 +1905,13 @@ export default function piDuo(pi: ExtensionAPI) {
   registerTools(pi, "austin");
   installWriteGuard(pi, "austin");
 
-  (pi as any).__registerTonyTools = (tonyApi: ExtensionAPI, activeTurn?: number) => {
+  (pi as any).__registerTonyTools = (
+    tonyApi: ExtensionAPI,
+    activeTurn?: number,
+    testTony?: AgentSession,
+  ) => {
     if (activeTurn !== undefined) activeTonyUserTurn = activeTurn;
+    if (testTony) tony = testTony;
     registerTools(tonyApi, "tony");
     installWriteGuard(tonyApi, "tony");
   };

@@ -12,11 +12,11 @@
 <p align="center">
   <a href="https://github.com/atfa/pi-duo"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-atfa%2Fpi--duo-181717?logo=github"></a>
   <img alt="Pi" src="https://img.shields.io/badge/Pi-%E2%89%A5%200.85.1-7C3AED">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.3.2-00C2A8">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.3.3-00C2A8">
   <img alt="Tests" src="https://img.shields.io/badge/tests-passing-22C55E">
 </p>
 
-> **0.3.2 提示**：pi-duo 落地了完整的 **Execution Gate 与验证回退** 状态机规则：仅 `EXECUTE` 阶段允许 Austin 修改项目文件；`VERIFY` 阶段工作区完全冻结；`COMPLETE` 后修改文件必须显式 `reopen`；Tony `reviewFinding` 自动回退至 `EXECUTE` 并清除待决 review；旧 user turn 异步任务绝不污染新回合。
+> **0.3.3 提示**：Execution Gate 现在约束当前 workspace owner：无论 owner 是 Austin 还是 Tony，只有 `EXECUTE` 可以修改集成工作区；Tony scratch 写入仍可用。degraded 只放宽 Austin 的 `EXPLORE/CONVERGE` 协作屏障，`VERIFY/COMPLETE` 仍冻结；Tony 不可用时不能创建 pending review。
 
 ## 为什么需要 pi-duo？
 
@@ -400,11 +400,11 @@ NODE
 
 项目工作区的修改受协作阶段严格控制：
 
-- **Only EXECUTE permits Austin to modify project files in normal collaboration mode.** 在正常协作模式下，仅 `EXECUTE` 阶段允许 Austin 修改项目文件；`EXPLORE` 与 `CONVERGE` 阶段的修改会被拦截。
-- **VERIFY freezes the project workspace while Tony independently verifies the deliverable.** 在 `VERIFY` 阶段，交付物进入冻结状态由 Tony 进行独立验收，禁止修改项目文件。
-- **After COMPLETE, Austin must explicitly reopen the collaboration before changing verified project files.** 在 `COMPLETE` 阶段，交付物属于已验证的完成状态；Austin 若需要修改项目文件，必须显式调用 `duo_checkpoint(action="reopen")` 退回 `EXECUTE`。
+- **Only EXECUTE permits the current workspace owner to modify project files.** 无论 owner 是 Austin 还是 Tony，`EXPLORE` 与 `CONVERGE` 都会拦截集成工作区修改；Tony 的 `.pi-duo/tmp/tony` scratch 写入不受此限制。
+- **VERIFY freezes the project workspace while Tony independently verifies the deliverable.** 在 `VERIFY` 阶段，交付物进入冻结状态，所有 actor 都不能修改项目文件。
+- **After COMPLETE, the workspace owner must explicitly reopen before changing verified project files.** 在 `COMPLETE` 阶段，交付物属于已验证的完成状态；需先由 Austin 调用 `duo_checkpoint(action="reopen")` 退回 `EXECUTE`。
 - **Tony reviewFinding returns the collaboration to EXECUTE. Austin fixes the issues and starts a fresh verification checkpoint.** 当 Tony 发现缺陷并提交 `reviewFinding=true` 时，状态机自动退回 `EXECUTE` 阶段并解除写入限制；Austin 修复后重新发起 `ready_for_verification`。
-- **Degraded mode bypass**：若 Tony 启动失败或异常导致 `collaboration.degraded === true`，Execution Gate 会对 Austin 放行，保证单 Agent 模式不会死锁。
+- **Degraded mode bypass**：若 Tony 启动失败或异常导致 `collaboration.degraded === true`，仅 Austin 可在 `EXPLORE/CONVERGE` 继续单 Agent 工作；`VERIFY/COMPLETE` 仍冻结，`EXECUTE` 仍按 owner/writePolicy 决定。
 
 `important` 和 `decision` 可以使用保留槽，并在总预算耗尽后进入 deferred 持久化槽。
 
@@ -422,7 +422,7 @@ NODE
 驱动 `EXECUTE -> VERIFY -> COMPLETE` 阶段跃迁，将 Review 解耦并移至交付终点：
 
 - `status`：查看当前协作阶段与验收状态；
-- `ready_for_verification`：仅 Austin 在 `EXECUTE` 阶段调用；代码实现完成后主动发起验收请求，唤醒 Tony 切换为独立验收模式（进入 `VERIFY` 阶段）；
+- `ready_for_verification`：仅 Austin 在 `EXECUTE` 且 Tony 当前可用时调用；代码实现完成后主动发起验收请求，唤醒 Tony 切换为独立验收模式（进入 `VERIFY` 阶段）。Tony 不可用时请求会被拒绝，不会留下 pending review；
 - `complete`：正常由 Tony `reviewComplete=true` 自动完成；此命令仅供 Austin 手动确认已 reported 的验收；
 - `reopen`：仅 Austin 在 `VERIFY` 或 `COMPLETE` 阶段调用；验收发现严重问题时重新打开回到 `EXECUTE` 阶段。
 

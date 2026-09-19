@@ -98,17 +98,25 @@ export function isBlockedByFirstSyncBarrier(
 export function workspaceMutationBlockReason(
   actor: AgentId,
   collaboration?: DuoCollaborationState,
+  workspaceOwner: AgentId | null = actor,
 ): string | undefined {
-  if (actor !== "austin" || !collaboration) {
+  if (!collaboration || workspaceOwner !== actor) {
     return undefined;
   }
 
-  if (collaboration.degraded) {
+  if (
+    collaboration.degraded &&
+    actor === "austin" &&
+    (collaboration.phase === "explore" || collaboration.phase === "converge")
+  ) {
     return undefined;
   }
 
   switch (collaboration.phase) {
     case "explore":
+      if (actor !== "austin") {
+        return "Collaboration is still in EXPLORE. Only EXECUTE permits the current workspace owner to modify project files.";
+      }
       if (!collaboration.tonyInitialContribution) {
         return (
           "First Collaboration Barrier: Austin must wait for Tony's " +
@@ -122,6 +130,9 @@ export function workspaceMutationBlockReason(
       );
 
     case "converge":
+      if (actor !== "austin") {
+        return "Collaboration is in CONVERGE. Only EXECUTE permits the current workspace owner to modify project files.";
+      }
       return (
         'Collaboration is in CONVERGE. Commit the shared working plan ' +
         'with duo_plan(action="commit") before modifying project files.'
