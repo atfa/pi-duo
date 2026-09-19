@@ -12,30 +12,44 @@
 <p align="center">
   <a href="https://github.com/atfa/pi-duo"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-atfa%2Fpi--duo-181717?logo=github"></a>
   <img alt="Pi" src="https://img.shields.io/badge/Pi-%E2%89%A5%200.85.1-7C3AED">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.2.0_beta-00C2A8">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-15%20passing-22C55E">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.3.0-00C2A8">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-passing-22C55E">
 </p>
 
-> **Beta 提示**：pi-duo 已在真实项目中完成持久会话、后台协作、写入保护、恢复和消息预算测试，但仍建议在 Git 仓库或一次性分支中使用。它不是操作系统级沙箱。
+> **0.3.0 提示**：pi-duo 现已全面升级为 **“先协作、后执行、最后验证”** 的对等协作状态机。Austin 与 Tony 从传统的“写-审”流水线，演进为涵盖探索、收敛、执行与独立验收的真正对等协作模式。
 
 ## 为什么需要 pi-duo？
 
 普通 subagent 往往是一次性调用：主 Agent 提问，子 Agent 返回一段结果，然后上下文消失。pi-duo 采用不同的方式：
 
-- Austin 和 Tony 都是有独立历史的、可恢复的 Pi session；
-- peer 消息进入对方真实 session/context，而不是只写到一个 Markdown 文件；
-- 两人共享目标、todo、决策、workspace ownership 和精选消息；
-- 不复制完整 conversation，避免共享状态无限膨胀；
-- 默认只有 Austin 修改项目文件，Tony 专注独立验证，降低冲突和锁争夺；
-- 通过消息预算、重复抑制和 deferred 投递阻止 Agent 无限互聊。
+- **对等双 Agent**：Austin 和 Tony 都是有独立历史的、可恢复的持久 Pi session；
+- **真实 context 通信**：peer 消息进入对方真实 session/context，支持语义分类与彩色渲染；
+- **全生命周期状态机**：
+  ```text
+  user task
+     ↓
+  EXPLORE (Austin & Tony 独立探索，交换 proposal / evidence)
+     ↓
+  CONVERGE (方案碰撞，通过 duo_plan 达成工作共识或记录分歧)
+     ↓
+  EXECUTE (Austin 实现代码，Tony 进行测试、调查与诊断)
+     ↓
+  VERIFY (Austin 触发 duo_checkpoint，Tony 独立验收)
+     ↓
+  COMPLETE (确认交付)
+  ```
+- **首要协作屏障 (First Collaboration Barrier)**：在 EXPLORE 阶段，强制 Austin 等待 Tony 的独立输入或观点碰撞，避免前台 Agent 抢跑；
+- **审查与执行解耦**：用户任务到来时不预设审查挂起；review 仅在代码实现完成并显式发起验收时启动；
+- **共享工作面**：goal、plan、todo、decisions、workspace ownership 和审计流持久化在项目内；
+- **循环保护与单写者**：默认 Austin 唯一修改项目代码，搭配消息预算与防死锁设计。
 
 ```mermaid
 flowchart LR
-    U[用户] --> A[Austin\n前台 Pi session]
-    A <-->|精选 peer 消息| T[Tony\n后台 Pi session]
+    U[用户] --> A[Austin\n前台 Driver / Integrator]
+    A <-->|精选 peer 消息\nkind: proposal/evidence/objection| T[Tony\n后台 Collaborator / Verifier]
     A --> W[项目 workspace]
-    T -. 默认只读分析/测试 .-> W
-    A <--> S[.pi-duo\n目标 · todo · 决策 · 消息]
+    T -. 默认只读分析/测试/验收 .-> W
+    A <--> S[.pi-duo\nphase · plan · todo · decisions]
     T <--> S
 ```
 
@@ -362,28 +376,47 @@ NODE
 
 ### `duo_send`
 
-普通 `duo_send` 只表示阶段性协作，不会结束审查。Tony 只有在当前交付物已经存在、并完成独立检查和验证后，才使用 `reviewComplete=true` 提交汇总报告；该显式报告会把 review 标记为 `reported` 并唤醒 Austin。这样，前期规格建议不会被误判为最终审查。
-
-Tony 在后台审查时，Pi 的页脚和输入框下方会持续显示无边框状态面板。Tony 提出修改、最终完成或审查失败时，指示会分别切换为待修复、完成或失败状态，避免 Austin 回到提示符后被误认为整个 Duo 已结束。状态面板不绘制固定宽度框线，以兼容不同终端对中英文字符宽度的处理。
-
-Tony 发出消息后必须结束当前回合，后续工具调用会被控制面拦截，直到 Austin 投递新工作。若审查发现需要修改的问题，Tony 使用 `reviewFinding=true` 发送一次汇总报告：它会绕过普通消息预算并唤醒 Austin，但 review 继续保持 `pending`。
-
 向 peer 的真实持久 context 发送精选消息。
 
 参数：
 
 - `message`：消息正文；
-- `importance`：`normal`、`important` 或 `decision`。
-- `reviewComplete`：仅 Tony 使用；只有完成对当前交付物的独立验证后才设为 `true`。
-- `reviewFinding`：仅 Tony 使用；发现需要 Austin 修改的问题时设为 `true`，强制唤醒 Austin，但不结束 review。
+- `importance`：`normal`、`important` 或 `decision`；
+- `kind`（可选）：消息语义分类：
+  - `proposal` / `idea`：💡 方案与构想
+  - `evidence`：🔬 实验、日志与代码证据
+  - `objection`：⚠️ 异议与风险提示（记录分歧，支持 agree or disagree-and-proceed）
+  - `checkpoint`：🏁 里程碑提示
+  - `verification`：✅ 独立验证通过
+  - `finding`：🔍 验收或调查发现的问题
+  - `question`：❓ 关键提问
+  - `decision`：📋 决策同步
+- `reviewComplete`：仅 Tony 在验收阶段使用；只有完成对当前交付物的独立验证后才设为 `true`。
+- `reviewFinding`：仅 Tony 在验收阶段使用；发现需要 Austin 修改的问题时设为 `true`，强制唤醒 Austin，但保持 review 挂起。
 
 `important` 和 `decision` 可以使用保留槽，并在总预算耗尽后进入 deferred 持久化槽。
 
-向 Tony 投递时工具会立即返回，不等待 Tony 跑完整个模型回合。Tony 的结果会作为后续 peer message 自动唤醒 Austin，因此 Austin 不应轮询或重复发送同一请求。
+### `duo_plan`
+
+维护双方的工作方案共识（Working Agreement），驱动 `CONVERGE -> EXECUTE` 阶段跃迁：
+
+- `get`：读取当前共识方案及未决异议；
+- `propose` / `revise`：提出或修正方案；
+- `commit`：正式敲定方案，协作状态机进入 `EXECUTE` 阶段；
+- `unresolvedObjection`：允许保留无法消除的技术分歧，不追求虚假共识。
+
+### `duo_checkpoint`
+
+驱动 `EXECUTE -> VERIFY -> COMPLETE` 阶段跃迁，将 Review 解耦并移至交付终点：
+
+- `status`：查看当前协作阶段与验收状态；
+- `ready_for_verification`：Austin 完成编码后主动发起验收请求，唤醒 Tony 切换为独立验收模式；
+- `complete`：Tony 验证通过后确认完成（或 Austin 确认交付）；
+- `reopen`：验收发现严重问题时重新打开回到 `EXECUTE` 阶段。
 
 ### `duo_status`
 
-读取当前角色、goal、todo、模型、session、策略、workspace owner 和活动状态。
+读取当前角色、phase、plan、review、goal、todo、模型、session、策略、workspace owner 和活动状态。
 
 ### `duo_goal`
 
@@ -407,7 +440,7 @@ Tony 发出消息后必须结束当前回合，后续工具调用会被控制面
 - `done`
 - `blocked`
 
-todo 可指定 `owner: austin | tony`，并支持 `expectedRevision` 防止并发覆盖。
+todo 可指定 `owner: austin | tony`，并支持 `expectedRevision` 防止并发覆盖。在 `CONVERGE` 阶段若有 todo 被认领为 `in_progress`，会自动平滑推进至 `EXECUTE`。
 
 ### `duo_decisions`
 

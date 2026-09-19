@@ -20,11 +20,12 @@ import type {
 export const DEFAULT_CONFIG: DuoConfig = {
   maxPeerMessagesPerTurn: 6,
   maxDeferredMessagesPerTurn: 2,
-  maxConsecutivePeerTurns: 3,
+  maxConsecutivePeerTurns: 4,
   similarityThreshold: 0.9,
   autoDispatch: true,
   writePolicy: "austin-only",
 };
+
 
 export const MIN_PEER_MESSAGES_PER_TURN = 4;
 
@@ -398,8 +399,13 @@ export function formatSharedContext(state: DuoState): string {
   const review = state.review
     ? `${state.review.status} (user turn ${state.review.userTurn})${state.review.error ? ` — ${state.review.error}` : ""}`
     : "not started";
-  return `## Duo shared state (revision ${state.revision})\nGOAL\n${state.goal || "(not set)"}\n\nTODO\n${todos}\n\nDURABLE DECISIONS\n${decisions}\n\nTony review: ${review}\nWorkspace write owner: ${state.workspaceOwner ?? "none"}`;
+  const collab = state.collaboration;
+  const phaseInfo = collab
+    ? `COLLABORATION PHASE: ${collab.phase.toUpperCase()}${collab.plan ? `\nPLAN (rev ${collab.planRevision}): ${collab.plan}` : ""}${collab.unresolvedObjection ? `\nUNRESOLVED OBJECTION: ${collab.unresolvedObjection}` : ""}\n\n`
+    : "";
+  return `## Duo shared state (revision ${state.revision})\nGOAL\n${state.goal || "(not set)"}\n\n${phaseInfo}TODO\n${todos}\n\nDURABLE DECISIONS\n${decisions}\n\nTony review: ${review}\nWorkspace write owner: ${state.workspaceOwner ?? "none"}`;
 }
+
 
 export function textSimilarity(a: string, b: string): number {
   const tokenize = (value: string) =>

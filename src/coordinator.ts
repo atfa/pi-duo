@@ -1,4 +1,10 @@
-import type { AgentId, DuoConfig, WritePolicy } from "./types.js";
+import type {
+  AgentId,
+  DuoCollaborationState,
+  DuoConfig,
+  PeerMessageKind,
+  WritePolicy,
+} from "./types.js";
 import { DuoStore, textSimilarity } from "./store.js";
 
 export type TriggerDelivery =
@@ -49,6 +55,43 @@ export function roleDescription(actor: AgentId): string {
   return actor === "austin"
     ? "Austin (foreground agent; not Tony)"
     : "Tony (background peer; not Austin)";
+}
+
+export function formatKindPrefix(kind?: PeerMessageKind): string {
+  switch (kind) {
+    case "proposal":
+    case "idea":
+      return "💡 Proposal";
+    case "evidence":
+      return "🔬 Evidence";
+    case "objection":
+      return "⚠️ Objection";
+    case "checkpoint":
+      return "🏁 Checkpoint";
+    case "verification":
+      return "✅ Verification";
+    case "finding":
+      return "🔍 Finding";
+    case "question":
+      return "❓ Question";
+    case "decision":
+      return "📋 Decision";
+    default:
+      return "";
+  }
+}
+
+export function isBlockedByFirstSyncBarrier(
+  actor: AgentId,
+  collaboration?: DuoCollaborationState,
+): boolean {
+  if (actor !== "austin") return false;
+  if (!collaboration) return false;
+  if (collaboration.degraded) return false;
+  return (
+    collaboration.phase === "explore" &&
+    !collaboration.tonyInitialContribution
+  );
 }
 
 export function parseAgentTarget(value: string | undefined): AgentId | undefined {
@@ -103,6 +146,7 @@ export function openCompletionTodoIds(state: {
 }
 
 export function completionGateNotice(state: {
+  collaboration?: { phase: string };
   review?: { status: "pending" | "reported" | "failed" };
   todo: Array<{
     id: number;
@@ -110,7 +154,14 @@ export function completionGateNotice(state: {
     owner?: AgentId;
   }>;
 }): string | undefined {
-  if (state.review?.status === "pending") {
+  if (state.collaboration) {
+    if (
+      state.collaboration.phase === "verify" &&
+      state.review?.status === "pending"
+    ) {
+      return "Duo review pending: this is a preliminary Austin result, not the final reviewed outcome. Tony is independently verifying the deliverable.";
+    }
+  } else if (state.review?.status === "pending") {
     return "Duo review pending: this is a preliminary Austin result, not the final reviewed outcome. Tony is still working and will wake Austin when the first review report is ready.";
   }
   const ids = openCompletionTodoIds(state);
@@ -119,6 +170,7 @@ export function completionGateNotice(state: {
   }
   return undefined;
 }
+
 
 export function canCompleteReview(
   actor: AgentId,

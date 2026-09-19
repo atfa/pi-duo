@@ -21,6 +21,8 @@ import {
   controlPlaneDelivery,
   completionGateNotice,
   dispatchControlPlaneTask,
+  formatKindPrefix,
+  isBlockedByFirstSyncBarrier,
   LoopGuard,
   openCompletionTodoIds,
   parseAgentTarget,
@@ -41,33 +43,46 @@ import {
 } from "./src/store.js";
 import type {
   AgentId,
+  CollaborationPhase,
+  DuoCollaborationState,
   DuoConfig,
   DuoState,
   ModelRef,
+  PeerMessage,
+  PeerMessageKind,
   TodoStatus,
 } from "./src/types.js";
 
-const BASE_POLICY = `## Duo cooperation policy
-You are one of two peer coding agents working on the same goal. Your peer is an independent reasoning agent, not your subordinate.
-Do not agree automatically. Challenge weak assumptions. Resolve disagreement with a discriminating test, code inspection, or log inspection instead of prolonged argument.
-Share important discoveries, evidence, and decisions. Avoid acknowledgements with no new information. Do not wait for consensus on obvious low-risk actions. If duo_send reports that a message was saved without triggering a turn, do not resend it; the peer will see it in persistent context later.
-Never run sleep commands or poll while waiting for the peer. Send your current work with duo_send and end the turn; a later peer message will trigger another turn.
-For consequential architecture changes, request peer review when practical. Use duo_send selectively; the peer has an independent persistent context.`;
+const BASE_POLICY = `## Duo collaboration policy
+You are one of two peer coding agents collaborating on the same goal. Your peer is an independent reasoning agent, not your subordinate.
+Do not agree automatically. Challenge weak assumptions with code inspection, discriminating tests, or evidence.
+Share important discoveries, evidence, and proposals. Avoid empty acknowledgements. If duo_send reports that a message was saved without triggering a turn, do not resend it; the peer will see it in persistent context later.
+Never run sleep commands or poll while waiting for the peer. Send your current work or thoughts with duo_send and end the turn.
+For consequential architecture changes, align with your peer. Use duo_send selectively; the peer has an independent persistent context.`;
 
 function cooperationPolicy(config: DuoConfig, actor: AgentId): string {
   const identityPolicy =
     actor === "austin"
-      ? `## Fixed role identity
-You are Austin, the foreground agent. Tony is the background peer. Never identify yourself as Tony or spend a peer message asking the peer to confirm identities.
-Before your final user-facing answer, reconcile the shared duo_todo list: mark completed work done and leave genuinely unfinished work pending or blocked.`
-      : `## Fixed role identity
-You are Tony, the background peer. Austin is the foreground agent. Never identify yourself as Austin or spend a peer message asking the peer to confirm identities.
-Consolidate review findings instead of narrating every intermediate check. If shared todos are stale, tell Austin which items need reconciliation.
-A normal duo_send is preliminary coordination and does not finish the review. After any duo_send, end your turn immediately; the control plane will block further tools until Austin sends new work. If independent review finds actionable changes, send one consolidated report with reviewFinding=true so it reaches Austin even when the ordinary message budget is exhausted, while keeping review pending. Only after you have inspected the current deliverable and completed independent verification, send the consolidated final report with reviewComplete=true. Never set reviewComplete while files are absent, still changing, or awaiting a promised verification.`;
+      ? `## Austin role identity (Foreground Driver & Integrator)
+You are Austin, the foreground agent and primary integrator. Tony is your background peer collaborator.
+- In the EXPLORE phase, independently analyze the user's task. Do not edit project files immediately; wait for Tony's initial perspective or exchange ideas.
+- In the CONVERGE phase, align on a working plan using duo_plan or duo_todo. You may disagree and proceed when justified.
+- In the EXECUTE phase, implement changes while Tony conducts tests, investigates edge cases, and provides empirical evidence.
+- When the deliverable is ready, declare it using duo_checkpoint(action="ready_for_verification") to initiate Tony's independent verification.
+- Before your final user-facing answer, reconcile the shared duo_todo list: mark completed work done and leave genuinely unfinished work pending or blocked.`
+      : `## Tony role identity (Background Collaborator & Verifier)
+You are Tony, the background peer collaborator. Austin is the foreground agent.
+- In the EXPLORE phase, independently analyze the task before relying on Austin's conclusions. Inspect code, logs, and constraints. Share your view with duo_send(kind='proposal' | 'evidence' | 'objection').
+- In the CONVERGE phase, collaborate on the solution approach, challenge assumptions, or propose concrete steps.
+- In the EXECUTE phase, design tests, reproduce issues, analyze logs, and supply empirical evidence to Austin.
+- In the VERIFY phase (triggered after Austin calls duo_checkpoint), independently inspect the changed code, run verification tests, and report findings or confirm completion.
+- After any duo_send, end your turn immediately; the control plane will block further tools until Austin sends new work.
+- In the VERIFY phase, use reviewFinding=true for actionable defects while keeping review pending; use reviewComplete=true when verification succeeds.
+- Never identify yourself as Austin or spend a peer message asking to confirm identities.`;
   const workspacePolicy =
     config.writePolicy === "austin-only"
       ? `## Austin-only write policy
-Austin is the sole writer of project files. Tony must not modify project files, run recognizable workspace-mutating shell commands, request workspace ownership, or ask Austin to transfer it. Tony may use write/edit only inside .pi-duo/tmp/tony for disposable test harnesses; run them with read-only shell commands and leave project files untouched. Tony should work as an independent reader, investigator, tester, and reviewer. Consolidate findings into concise reports with file:line evidence, failure conditions, and acceptance tests. Austin should implement changes and request Tony review at material checkpoints. Shared .pi-duo state and Tony's own session persistence are exempt from this project-file policy.`
+Austin is the sole writer of project files during implementation. Tony should focus on independent investigation, test design, counterexamples, and verification. Tony may use write/edit only inside .pi-duo/tmp/tony for disposable test harnesses; run them with read-only shell commands and leave project files untouched. Austin implements changes and requests Tony's verification via duo_checkpoint. Shared .pi-duo state and Tony's own session persistence are exempt from this project-file policy.`
       : `## Transferable write policy
 Workspace ownership may move between Austin and Tony. A release or transfer wakes the peer in either direction; do not spend another peer message merely repeating that handoff.`;
   return `${BASE_POLICY}\n\n${identityPolicy}\n\n${workspacePolicy}`;
@@ -85,6 +100,19 @@ const SendSchema = Type.Object({
       Type.Literal("decision"),
     ]),
   ),
+  kind: Type.Optional(
+    Type.Union([
+      Type.Literal("proposal"),
+      Type.Literal("evidence"),
+      Type.Literal("objection"),
+      Type.Literal("checkpoint"),
+      Type.Literal("idea"),
+      Type.Literal("question"),
+      Type.Literal("decision"),
+      Type.Literal("finding"),
+      Type.Literal("verification"),
+    ]),
+  ),
   reviewComplete: Type.Optional(
     Type.Boolean({
       description:
@@ -96,6 +124,30 @@ const SendSchema = Type.Object({
       description:
         "Tony only: send one consolidated actionable review report that must wake Austin while leaving the review pending",
     }),
+  ),
+});
+const PlanSchema = Type.Object({
+  action: Type.Union([
+    Type.Literal("get"),
+    Type.Literal("propose"),
+    Type.Literal("revise"),
+    Type.Literal("commit"),
+  ]),
+  plan: Type.Optional(Type.String({ description: "Working agreement plan" })),
+  unresolvedObjection: Type.Optional(
+    Type.String({ description: "Recorded objection if agreeing to disagree" }),
+  ),
+  expectedRevision: Type.Optional(Type.Number()),
+});
+const CheckpointSchema = Type.Object({
+  action: Type.Union([
+    Type.Literal("status"),
+    Type.Literal("ready_for_verification"),
+    Type.Literal("complete"),
+    Type.Literal("reopen"),
+  ]),
+  summary: Type.Optional(
+    Type.String({ description: "Summary of changes or verification result" }),
   ),
 });
 const GoalSchema = Type.Object({
@@ -175,9 +227,24 @@ function renderStatus(
 ): string {
   const counts = { pending: 0, in_progress: 0, done: 0, blocked: 0 };
   for (const item of state.todo) counts[item.status]++;
-  return [
+  const lines = [
     `Duo: ${state.status} (revision ${state.revision})`,
     `Current role: ${roleDescription(actor)}`,
+  ];
+  if (state.collaboration) {
+    lines.push(`Phase: ${state.collaboration.phase.toUpperCase()}`);
+    if (state.collaboration.plan) {
+      lines.push(
+        `Plan (rev ${state.collaboration.planRevision}): ${state.collaboration.plan}`,
+      );
+    }
+    if (state.collaboration.unresolvedObjection) {
+      lines.push(
+        `Unresolved objection: ${state.collaboration.unresolvedObjection}`,
+      );
+    }
+  }
+  lines.push(
     `Goal: ${state.goal || "(not set)"}`,
     `Todo: ${counts.done}/${state.todo.length} done, ${counts.in_progress} active, ${counts.blocked} blocked`,
     `Austin: ${modelText(stateModel(state, "austin"))} · session ${state.agents.austin.sessionId?.slice(0, 8) ?? "?"}`,
@@ -187,8 +254,10 @@ function renderStatus(
     `Tony review: ${state.review ? `${state.review.status} (user turn ${state.review.userTurn})` : "not started"}`,
     `Peer messages: ${state.peerMessageCount} total · Austin → Tony ${state.austinPeerMessageCount ?? 0} · Tony → Austin ${state.tonyPeerMessageCount ?? 0}`,
     `Last activity: ${state.lastActivityAt}`,
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
+
 
 function latestAssistantOutcome(
   session: AgentSession,
@@ -521,6 +590,7 @@ export default function piDuo(pi: ExtensionAPI) {
     importance: "normal" | "important" | "decision" = "important",
     triggerTurn = false,
     bypassGuard = false,
+    kind?: PeerMessageKind,
   ) => {
     const generation = lifecycleGeneration;
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
@@ -546,21 +616,58 @@ export default function piDuo(pi: ExtensionAPI) {
       to: "austin",
       content,
       importance,
+      kind,
       deferred: deferred || undefined,
       userTurn: messageUserTurn,
     });
     tonyPeerMessages++;
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
+
+    await store.update((draft) => {
+      if (!draft.collaboration) {
+        draft.collaboration = {
+          userTurn: messageUserTurn,
+          phase: "explore",
+          austinContributed: false,
+          tonyContributed: true,
+          tonyInitialContribution: true,
+          contested: false,
+          planRevision: 0,
+        };
+      } else {
+        draft.collaboration.tonyContributed = true;
+        draft.collaboration.tonyInitialContribution = true;
+        if (kind === "objection") {
+          draft.collaboration.contested = true;
+          draft.collaboration.unresolvedObjection = content.slice(0, 300);
+        }
+        if (kind === "verification") {
+          draft.collaboration.phase = "complete";
+          if (draft.review) draft.review.status = "reported";
+        } else if (kind === "finding") {
+          if (draft.review) draft.review.status = "pending";
+        }
+        if (
+          draft.collaboration.phase === "explore" &&
+          draft.collaboration.austinContributed
+        ) {
+          draft.collaboration.phase = "converge";
+        }
+      }
+    });
+
     let delivery: Parameters<ExtensionAPI["sendMessage"]>[1] = {
       triggerTurn: false,
     };
     if (!deferred && triggerTurn)
       delivery = { triggerTurn: true, deliverAs: "steer" };
+    const kindPrefix = formatKindPrefix(kind);
+    const prefixStr = kindPrefix ? ` ${kindPrefix}` : "";
     sendMessageSafely(
       {
         customType: "pi-duo-peer",
-        content: `[Tony]${deferred ? " [saved without triggering a turn]" : ""}\n${content}`,
-        display: importance !== "normal",
+        content: `[Tony${prefixStr}]${deferred ? " [saved without triggering a turn]" : ""}\n${content}`,
+        display: importance !== "normal" || Boolean(kind),
         details: message,
       },
       delivery,
@@ -574,6 +681,7 @@ export default function piDuo(pi: ExtensionAPI) {
   const sendToTony = async (
     content: string,
     importance: "normal" | "important" | "decision" = "important",
+    kind?: PeerMessageKind,
   ) => {
     const generation = lifecycleGeneration;
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
@@ -596,10 +704,34 @@ export default function piDuo(pi: ExtensionAPI) {
       to: "tony",
       content,
       importance,
+      kind,
       deferred: deferred || undefined,
       userTurn: guard.turn,
     });
     austinPeerMessages++;
+
+    await store.update((draft) => {
+      if (!draft.collaboration) {
+        draft.collaboration = {
+          userTurn: guard.turn,
+          phase: "explore",
+          austinContributed: true,
+          tonyContributed: false,
+          tonyInitialContribution: false,
+          contested: false,
+          planRevision: 0,
+        };
+      } else {
+        draft.collaboration.austinContributed = true;
+        if (
+          draft.collaboration.phase === "explore" &&
+          draft.collaboration.tonyContributed
+        ) {
+          draft.collaboration.phase = "converge";
+        }
+      }
+    });
+
     const activeTony = tony;
     const wasStreaming = activeTony.isStreaming;
     let delivery: Parameters<AgentSession["sendCustomMessage"]>[1] = {
@@ -609,11 +741,13 @@ export default function piDuo(pi: ExtensionAPI) {
       if (wasStreaming) delivery = { triggerTurn: true, deliverAs: "steer" };
       else delivery = triggeringDelivery(false);
     }
+    const kindPrefix = formatKindPrefix(kind);
+    const prefixStr = kindPrefix ? ` ${kindPrefix}` : "";
     if (deferred) {
       await activeTony.sendCustomMessage(
         {
           customType: "pi-duo-peer",
-          content: `[Austin] [saved without triggering a turn]\n${content}`,
+          content: `[Austin${prefixStr}] [saved without triggering a turn]\n${content}`,
           display: false,
           details: message,
         },
@@ -632,7 +766,7 @@ export default function piDuo(pi: ExtensionAPI) {
           await activeTony.sendCustomMessage(
             {
               customType: "pi-duo-peer",
-              content: `[Austin]\n${content}`,
+              content: `[Austin${prefixStr}]\n${content}`,
               display: false,
               details: message,
             },
@@ -659,6 +793,7 @@ export default function piDuo(pi: ExtensionAPI) {
             );
             return;
           }
+
           if (tonySentSequence === sentBefore) {
             const final = outcome?.text.slice(0, 4000) ?? "";
             if (final) {
@@ -836,6 +971,7 @@ export default function piDuo(pi: ExtensionAPI) {
             "decision",
             true,
             true,
+            params.kind ?? "finding",
           );
           setReviewIndicator("waiting", "Tony 已提出修改要求");
           return result(
@@ -866,6 +1002,7 @@ export default function piDuo(pi: ExtensionAPI) {
             "decision",
             false,
             true,
+            params.kind ?? "verification",
           );
           if (!response.startsWith("Message delivered")) return result(response);
           const reported = await markReviewReported(current.review.userTurn);
@@ -889,17 +1026,158 @@ export default function piDuo(pi: ExtensionAPI) {
         }
         const response =
           actor === "austin"
-            ? await sendToTony(params.message, params.importance ?? "normal")
+            ? await sendToTony(
+                params.message,
+                params.importance ?? "normal",
+                params.kind,
+              )
             : await sendToAustin(
                 params.message,
                 params.importance ?? "normal",
                 true,
+                false,
+                params.kind,
               );
         return result(
           actor === "tony"
             ? `${response} End this turn now; wait for Austin's next message.`
             : response,
         );
+      },
+    });
+    api.registerTool({
+      name: "duo_plan",
+      label: "Duo Plan",
+      description:
+        "Get, propose, revise, or commit a shared working plan agreement (CONVERGE -> EXECUTE).",
+      parameters: PlanSchema,
+      execute: async (_id, params) => {
+        if (!store) return result("Duo has not been started");
+        if (params.action === "get") {
+          const state = await store.readState();
+          return result(
+            state?.collaboration?.plan
+              ? `Plan (rev ${state.collaboration.planRevision}): ${state.collaboration.plan}${state.collaboration.unresolvedObjection ? `\nUnresolved objection: ${state.collaboration.unresolvedObjection}` : ""}`
+              : "(no plan set)",
+            state,
+          );
+        }
+        const planText = params.plan?.trim();
+        if (!planText) {
+          return result("plan is required for propose, revise, or commit");
+        }
+
+        const state = await store.update((draft) => {
+          if (!draft.collaboration) {
+            draft.collaboration = {
+              userTurn: guard.turn,
+              phase: params.action === "commit" ? "execute" : "converge",
+              austinContributed: actor === "austin",
+              tonyContributed: actor === "tony",
+              tonyInitialContribution: actor === "tony",
+              contested: Boolean(params.unresolvedObjection),
+              planRevision: 1,
+              plan: planText,
+              unresolvedObjection: params.unresolvedObjection,
+            };
+          } else {
+            draft.collaboration.plan = planText;
+            draft.collaboration.planRevision += 1;
+            if (params.unresolvedObjection !== undefined) {
+              draft.collaboration.unresolvedObjection =
+                params.unresolvedObjection;
+              draft.collaboration.contested = true;
+            }
+            if (params.action === "commit") {
+              draft.collaboration.phase = "execute";
+            } else if (draft.collaboration.phase === "explore") {
+              draft.collaboration.phase = "converge";
+            }
+            if (actor === "austin") draft.collaboration.austinContributed = true;
+            if (actor === "tony") {
+              draft.collaboration.tonyContributed = true;
+              draft.collaboration.tonyInitialContribution = true;
+            }
+          }
+        }, params.expectedRevision);
+        return result(
+          `Plan ${params.action} recorded at revision ${state.revision} (Phase: ${state.collaboration?.phase.toUpperCase()}): ${state.collaboration?.plan}`,
+          state,
+        );
+      },
+    });
+    api.registerTool({
+      name: "duo_checkpoint",
+      label: "Duo Checkpoint",
+      description:
+        "Inspect, declare deliverable ready for independent verification, complete, or reopen.",
+      parameters: CheckpointSchema,
+      execute: async (_id, params) => {
+        if (!store) return result("Duo has not been started");
+        const currentState = await store.readState();
+        if (!currentState) return result("Duo has not been started");
+        if (params.action === "status") {
+          return result(
+            `Phase: ${currentState.collaboration?.phase ?? "unknown"}, Review: ${currentState.review?.status ?? "none"}`,
+            currentState,
+          );
+        }
+        if (params.action === "ready_for_verification") {
+          const state = await store.update((draft) => {
+            if (!draft.collaboration) {
+              draft.collaboration = {
+                userTurn: guard.turn,
+                phase: "verify",
+                austinContributed: true,
+                tonyContributed: false,
+                tonyInitialContribution: true,
+                contested: false,
+                planRevision: 0,
+              };
+            } else {
+              draft.collaboration.phase = "verify";
+            }
+            draft.review = {
+              userTurn: guard.turn,
+              status: "pending",
+              summary: params.summary,
+              updatedAt: new Date().toISOString(),
+            };
+          });
+          setReviewIndicator("working", "Tony 独立验证中");
+          queueTonyVerificationTask(params.summary, guard.turn);
+          return result(
+            `Checkpoint reached: deliverable ready for independent verification by Tony (revision ${state.revision})`,
+            state,
+          );
+        }
+        if (params.action === "complete") {
+          const state = await store.update((draft) => {
+            if (draft.collaboration) draft.collaboration.phase = "complete";
+            if (draft.review) {
+              draft.review.status = "reported";
+              if (params.summary) draft.review.summary = params.summary;
+              draft.review.updatedAt = new Date().toISOString();
+            }
+          });
+          setReviewIndicator("complete");
+          return result(
+            `Collaboration marked complete (revision ${state.revision})`,
+            state,
+          );
+        }
+        if (params.action === "reopen") {
+          const state = await store.update((draft) => {
+            if (draft.collaboration) draft.collaboration.phase = "execute";
+            if (draft.review) draft.review.status = "pending";
+          });
+          setReviewIndicator("working", "重新打开执行");
+          return result(
+            `Collaboration reopened into EXECUTE phase (revision ${state.revision})`,
+            state,
+          );
+        }
+        return result("Unknown checkpoint action");
       },
     });
     api.registerTool({
@@ -970,6 +1248,9 @@ export default function piDuo(pi: ExtensionAPI) {
           return result("Duo is stopped; use /duo resume before changing shared state.", current);
         let message = "";
         const state = await store.update((draft) => {
+          if (draft.collaboration?.phase === "converge") {
+            draft.collaboration.phase = "execute";
+          }
           if (params.action === "add") {
             if (!params.text?.trim())
               throw new Error("text is required for add");
@@ -1157,6 +1438,13 @@ export default function piDuo(pi: ExtensionAPI) {
       if (!mutating || !store) return;
       const latestConfig = await store.readConfig();
       const state = await enforceWritePolicy(store, latestConfig);
+      if (isBlockedByFirstSyncBarrier(actor, state?.collaboration)) {
+        return {
+          block: true,
+          reason:
+            "First Collaboration Barrier: In the EXPLORE phase, Austin must wait for Tony's initial independent contribution before modifying project files. Send ideas or exchange evidence with duo_send first, or wait for Tony.",
+        };
+      }
       if (
         !canMutateWorkspace(
           latestConfig.writePolicy,
@@ -1189,6 +1477,8 @@ export default function piDuo(pi: ExtensionAPI) {
           "duo_todo",
           "duo_decisions",
           "duo_workspace",
+          "duo_plan",
+          "duo_checkpoint",
         ].includes(event.toolName)
       )
         guard.noteMaterialActivity();
@@ -1332,27 +1622,26 @@ export default function piDuo(pi: ExtensionAPI) {
     }
   };
 
-  const queueTonyTask = (prompt: string, userTurn: number) => {
+  const queueTonyCollaborationTask = (prompt: string, userTurn: number) => {
     const generation = lifecycleGeneration;
     tonyQueue = tonyQueue
       .then(async () => {
         if (!isCurrentGeneration(generation) || !tony) return;
         const activeTony = tony;
-        setReviewIndicator("working", "等待 Tony 空闲后开始");
+        setReviewIndicator("working", "Tony 正在独立探索");
         // A followUp sent while Tony is streaming is only queued; its promise
         // resolves before that future turn finishes. Wait for the current turn
-        // to become idle, then start this review as its own attributable turn.
+        // to become idle, then start this collaboration as its own attributable turn.
         await activeTony.waitForIdle();
         if (!isCurrentGeneration(generation) || tony !== activeTony) return;
         tonyMustYield = false;
         activeTonyUserTurn = userTurn;
-        setReviewIndicator("working");
         const sentBefore = tonySentSequence;
         try {
           await activeTony.sendCustomMessage(
             {
               customType: "pi-duo-user-task",
-              content: `[Shared user task for ${roleDescription("tony")}]\nAustin is the foreground agent and owns project-file edits in austin-only mode. Independently inspect, test, and review; send concise evidence instead of implementing files. Preliminary coordination uses duo_send normally, then you must end the turn. Use reviewFinding=true for one consolidated actionable report that requests changes; keep the review pending until Austin responds. Only the consolidated, independently verified final report may use reviewComplete=true.\n\n${prompt}`,
+              content: `[Shared user task for Tony (Peer Collaborator)]\nYou are Tony, Austin's peer collaborator in this workspace.\nIndependently analyze the user's task before relying on Austin's conclusions.\n\nInspect relevant code, logs, architecture, and constraints.\nDevelop your own view of:\n- what the real problem is,\n- plausible approaches,\n- important risks,\n- useful experiments,\n- work that can be split between you and Austin.\n\nWhen you have a materially useful position, send it to Austin using duo_send(kind='proposal' | 'evidence' | 'objection').\nYou are encouraged to disagree when evidence supports it.\nDuring this EXPLORE phase, you are collaborating on the solution, not reviewing Austin's work.\nAustin will wait for your initial independent contribution before modifying project files.\n\nUser task:\n${prompt}`,
               display: false,
             },
             triggeringDelivery(false),
@@ -1360,11 +1649,88 @@ export default function piDuo(pi: ExtensionAPI) {
           if (!isCurrentGeneration(generation) || tony !== activeTony) return;
           const outcome = latestAssistantOutcome(activeTony);
           if (outcome?.error) {
-            await markReviewFailed(userTurn, outcome.error);
+            if (store) {
+              await store.update((draft) => {
+                if (draft.collaboration) {
+                  draft.collaboration.degraded = true;
+                  draft.collaboration.tonyInitialContribution = true;
+                }
+              });
+            }
             sendMessageSafely(
               {
                 customType: "pi-duo-peer",
-                content: `[Tony error]\n${outcome.error}`,
+                content: `[Tony error]\n${outcome.error}\n(Collaboration degraded to single-agent mode)`,
+                display: true,
+              },
+              { triggerTurn: false },
+              generation,
+            );
+            return;
+          }
+          if (tonySentSequence === sentBefore) {
+            const final = outcome?.text.slice(0, 4000) ?? "";
+            if (final) {
+              await sendToAustin(final, "important", true, false, "proposal");
+            }
+          }
+        } finally {
+          if (activeTonyUserTurn === userTurn) activeTonyUserTurn = undefined;
+        }
+      })
+      .catch(async (error) => {
+        if (activeTonyUserTurn === userTurn) activeTonyUserTurn = undefined;
+        const errorText = error instanceof Error ? error.message : String(error);
+        if (store) {
+          await store.update((draft) => {
+            if (draft.collaboration) {
+              draft.collaboration.degraded = true;
+              draft.collaboration.tonyInitialContribution = true;
+            }
+          });
+        }
+        sendMessageSafely(
+          {
+            customType: "pi-duo-peer",
+            content: `[Tony error]\n${errorText}\n(Collaboration degraded to single-agent mode)`,
+            display: true,
+          },
+          { triggerTurn: true },
+          generation,
+        );
+      });
+  };
+
+  const queueTonyVerificationTask = (summary?: string, userTurn?: number) => {
+    const generation = lifecycleGeneration;
+    const taskTurn = userTurn ?? guard.turn;
+    tonyQueue = tonyQueue
+      .then(async () => {
+        if (!isCurrentGeneration(generation) || !tony) return;
+        const activeTony = tony;
+        setReviewIndicator("working", "Tony 独立验证中");
+        await activeTony.waitForIdle();
+        if (!isCurrentGeneration(generation) || tony !== activeTony) return;
+        tonyMustYield = false;
+        activeTonyUserTurn = taskTurn;
+        const sentBefore = tonySentSequence;
+        try {
+          await activeTony.sendCustomMessage(
+            {
+              customType: "pi-duo-user-task",
+              content: `[Verification Request from Austin]\nAustin reports that the current deliverable is ready for independent verification.${summary ? `\nSummary: ${summary}` : ""}\n\nNow switch roles:\n- Independently verify the actual current implementation.\n- Re-read the changed files.\n- Run appropriate tests and validations.\n- Look for regressions and violated assumptions.\n\nIf actionable problems remain:\n  Send details with duo_send(kind='finding' | 'objection', reviewFinding=true, importance='important').\nIf verification succeeds:\n  Confirm with duo_send(kind='verification', reviewComplete=true, message='Verification passed...', importance='important') and call duo_checkpoint(action='complete').`,
+              display: false,
+            },
+            triggeringDelivery(false),
+          );
+          if (!isCurrentGeneration(generation) || tony !== activeTony) return;
+          const outcome = latestAssistantOutcome(activeTony);
+          if (outcome?.error) {
+            await markReviewFailed(taskTurn, outcome.error);
+            sendMessageSafely(
+              {
+                customType: "pi-duo-peer",
+                content: `[Tony verification error]\n${outcome.error}`,
                 display: true,
               },
               { triggerTurn: true },
@@ -1375,18 +1741,17 @@ export default function piDuo(pi: ExtensionAPI) {
           if (tonySentSequence === sentBefore) {
             const final = outcome?.text.slice(0, 4000) ?? "";
             if (final) {
-              await sendToAustin(final, "important", true, true);
-            }
-            else {
+              await sendToAustin(final, "important", true, false, "verification");
+            } else {
               await markReviewFailed(
-                userTurn,
-                "Tony completed without a review report",
+                taskTurn,
+                "Tony completed without a verification report",
               );
               sendMessageSafely(
                 {
                   customType: "pi-duo-peer",
                   content:
-                    "[Tony review unavailable]\nTony completed without a review report. Austin should finish with independent verification and disclose that peer review was unavailable.",
+                    "[Tony verification unavailable]\nTony completed without a verification report. Austin should finish with independent verification and disclose that peer verification was unavailable.",
                   display: true,
                 },
                 { triggerTurn: true },
@@ -1395,17 +1760,17 @@ export default function piDuo(pi: ExtensionAPI) {
             }
           }
         } finally {
-          if (activeTonyUserTurn === userTurn) activeTonyUserTurn = undefined;
+          if (activeTonyUserTurn === taskTurn) activeTonyUserTurn = undefined;
         }
       })
       .catch(async (error) => {
-        if (activeTonyUserTurn === userTurn) activeTonyUserTurn = undefined;
+        if (activeTonyUserTurn === taskTurn) activeTonyUserTurn = undefined;
         const errorText = error instanceof Error ? error.message : String(error);
-        await markReviewFailed(userTurn, errorText);
+        await markReviewFailed(taskTurn, errorText);
         sendMessageSafely(
           {
             customType: "pi-duo-peer",
-            content: `[Tony error]\n${errorText}`,
+            content: `[Tony verification error]\n${errorText}`,
             display: true,
           },
           { triggerTurn: true },
@@ -1417,11 +1782,15 @@ export default function piDuo(pi: ExtensionAPI) {
   registerTools(pi, "austin");
   installWriteGuard(pi, "austin");
 
-  pi.registerMessageRenderer(
-    "pi-duo-peer",
-    (message, _options, theme) =>
-      new Text(theme.fg("accent", String(message.content)), 0, 0),
-  );
+  pi.registerMessageRenderer("pi-duo-peer", (message, _options, theme) => {
+    const details = message.details as PeerMessage | undefined;
+    const kind = details?.kind;
+    let color: "accent" | "warning" | "success" | "muted" = "accent";
+    if (kind === "objection") color = "warning";
+    else if (kind === "verification") color = "success";
+    else if (kind === "evidence") color = "muted";
+    return new Text(theme.fg(color, String(message.content)), 0, 0);
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     foregroundUI = ctx.ui;
@@ -1558,18 +1927,27 @@ export default function piDuo(pi: ExtensionAPI) {
     if (foregroundDuoActive && state?.status === "active" && config.autoDispatch) {
       try {
         await ensureTony(ctx.cwd, ctx.modelRegistry);
-        const timestamp = new Date().toISOString();
         await currentStore.update((draft) => {
-          draft.review = {
+          draft.collaboration = {
             userTurn,
-            status: "pending",
-            startedAt: timestamp,
-            updatedAt: timestamp,
+            phase: "explore",
+            austinContributed: false,
+            tonyContributed: false,
+            tonyInitialContribution: false,
+            contested: false,
+            planRevision: 0,
           };
+          delete draft.review;
         });
-        setReviewIndicator("working");
-        queueMicrotask(() => queueTonyTask(event.text, userTurn));
+        setReviewIndicator("clear");
+        queueMicrotask(() => queueTonyCollaborationTask(event.text, userTurn));
       } catch (error) {
+        await currentStore.update((draft) => {
+          if (draft.collaboration) {
+            draft.collaboration.degraded = true;
+            draft.collaboration.tonyInitialContribution = true;
+          }
+        });
         ctx.ui.notify(
           `pi-duo could not dispatch Tony: ${error instanceof Error ? error.message : String(error)}`,
           "warning",

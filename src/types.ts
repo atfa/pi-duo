@@ -2,6 +2,24 @@ export type AgentId = "austin" | "tony";
 export type TodoStatus = "pending" | "in_progress" | "done" | "blocked";
 export type WritePolicy = "austin-only" | "transferable";
 
+export type CollaborationPhase =
+  | "explore"
+  | "converge"
+  | "execute"
+  | "verify"
+  | "complete";
+
+export type PeerMessageKind =
+  | "proposal"
+  | "evidence"
+  | "objection"
+  | "checkpoint"
+  | "idea"
+  | "question"
+  | "decision"
+  | "finding"
+  | "verification";
+
 export interface ModelRef {
   provider: string;
   modelId: string;
@@ -45,9 +63,23 @@ export interface DuoAgentState {
 export interface DuoReviewState {
   userTurn: number;
   status: "pending" | "reported" | "failed";
-  startedAt: string;
+  startedAt?: string;
   updatedAt: string;
+  summary?: string;
   error?: string;
+}
+
+export interface DuoCollaborationState {
+  userTurn: number;
+  phase: CollaborationPhase;
+  austinContributed: boolean;
+  tonyContributed: boolean;
+  tonyInitialContribution: boolean;
+  contested: boolean;
+  planRevision: number;
+  plan?: string;
+  unresolvedObjection?: string;
+  degraded?: boolean;
 }
 
 export interface DuoState {
@@ -62,6 +94,7 @@ export interface DuoState {
   agents: { austin: DuoAgentState; tony: DuoAgentState };
   status: "active" | "stopped";
   workspaceOwner: AgentId | null;
+  collaboration?: DuoCollaborationState;
   review?: DuoReviewState;
   peerMessageCount: number;
   /** Durable counts of messages sent across the Austin ↔ Tony control plane. */
@@ -78,7 +111,9 @@ export interface PeerMessage {
   to: AgentId;
   content: string;
   importance: "normal" | "important" | "decision";
+  kind?: PeerMessageKind;
   deferred?: boolean;
   timestamp: string;
   userTurn: number;
 }
+

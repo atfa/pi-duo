@@ -12,6 +12,8 @@ import {
   completionGateNotice,
   controlPlaneDelivery,
   dispatchControlPlaneTask,
+  formatKindPrefix,
+  isBlockedByFirstSyncBarrier,
   LoopGuard,
   openCompletionTodoIds,
   parseAgentTarget,
@@ -346,4 +348,80 @@ test("loop guard resumes a durable user-turn sequence after reload", () => {
   assert.equal(guard.beginUserTurn(7), 7);
   assert.equal(guard.turn, 7);
   assert.equal(guard.beginUserTurn(8), 8);
+});
+
+test("formatKindPrefix provides human readable emoji prefixes", () => {
+  assert.equal(formatKindPrefix("proposal"), "💡 Proposal");
+  assert.equal(formatKindPrefix("evidence"), "🔬 Evidence");
+  assert.equal(formatKindPrefix("objection"), "⚠️ Objection");
+  assert.equal(formatKindPrefix("checkpoint"), "🏁 Checkpoint");
+  assert.equal(formatKindPrefix("verification"), "✅ Verification");
+  assert.equal(formatKindPrefix("finding"), "🔍 Finding");
+  assert.equal(formatKindPrefix("question"), "❓ Question");
+  assert.equal(formatKindPrefix("decision"), "📋 Decision");
+  assert.equal(formatKindPrefix(undefined), "");
+});
+
+test("isBlockedByFirstSyncBarrier blocks Austin in explore phase before Tony contributes", () => {
+  assert.equal(
+    isBlockedByFirstSyncBarrier("austin", {
+      userTurn: 1,
+      phase: "explore",
+      austinContributed: false,
+      tonyContributed: false,
+      tonyInitialContribution: false,
+      contested: false,
+      planRevision: 0,
+    }),
+    true,
+  );
+  assert.equal(
+    isBlockedByFirstSyncBarrier("austin", {
+      userTurn: 1,
+      phase: "explore",
+      austinContributed: false,
+      tonyContributed: true,
+      tonyInitialContribution: true,
+      contested: false,
+      planRevision: 0,
+    }),
+    false,
+  );
+  assert.equal(
+    isBlockedByFirstSyncBarrier("tony", {
+      userTurn: 1,
+      phase: "explore",
+      austinContributed: false,
+      tonyContributed: false,
+      tonyInitialContribution: false,
+      contested: false,
+      planRevision: 0,
+    }),
+    false,
+  );
+  assert.equal(
+    isBlockedByFirstSyncBarrier("austin", {
+      userTurn: 1,
+      phase: "converge",
+      austinContributed: true,
+      tonyContributed: false,
+      tonyInitialContribution: false,
+      contested: false,
+      planRevision: 1,
+    }),
+    false,
+  );
+  assert.equal(
+    isBlockedByFirstSyncBarrier("austin", {
+      userTurn: 1,
+      phase: "explore",
+      austinContributed: false,
+      tonyContributed: false,
+      tonyInitialContribution: false,
+      contested: false,
+      planRevision: 0,
+      degraded: true,
+    }),
+    false,
+  );
 });

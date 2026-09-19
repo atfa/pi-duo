@@ -26,8 +26,10 @@ test("extension registers commands, tools, renderer, and lifecycle hooks without
   piDuo(api);
 
   assert.deepEqual(tools.sort(), [
+    "duo_checkpoint",
     "duo_decisions",
     "duo_goal",
+    "duo_plan",
     "duo_send",
     "duo_status",
     "duo_todo",
