@@ -6,8 +6,10 @@ import test from "node:test";
 import {
   DEFAULT_CONFIG,
   DuoStore,
+  formatSharedContext,
   isMutatingShell,
   isWaitingShell,
+  MIN_PEER_MESSAGES_PER_TURN,
   parseModelRef,
   textSimilarity,
 } from "../src/store.js";
@@ -51,6 +53,17 @@ test("persists config defaults and overrides", async () => {
     assert.equal(migrated.maxDeferredMessagesPerTurn, 2);
     await writeFile(store.configPath, '{"writePolicy":"invalid"}\n');
     assert.equal((await store.readConfig()).writePolicy, "austin-only");
+    await writeFile(
+      store.configPath,
+      '{"maxPeerMessagesPerTurn":1,"maxConsecutivePeerTurns":0,"similarityThreshold":2}\n',
+    );
+    const safe = await store.readConfig();
+    assert.equal(safe.maxPeerMessagesPerTurn, MIN_PEER_MESSAGES_PER_TURN);
+    assert.equal(
+      safe.maxConsecutivePeerTurns,
+      DEFAULT_CONFIG.maxConsecutivePeerTurns,
+    );
+    assert.equal(safe.similarityThreshold, DEFAULT_CONFIG.similarityThreshold);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -84,6 +97,46 @@ test("Austin-only policy normalizes stale workspace ownership", async () => {
   }
 });
 
+test("Tony scratch path is isolated under .pi-duo", async () => {
+  const { cwd, store } = await fixture();
+  try {
+    await store.ensureTonyScratch();
+    assert.equal(
+      store.isTonyScratchPath(".pi-duo/tmp/tony/review.js"),
+      true,
+    );
+    assert.equal(
+      store.isTonyScratchPath(path.join(store.tonyScratchDir, "nested/test.js")),
+      true,
+    );
+    assert.equal(store.isTonyScratchPath("src/review.js"), false);
+    assert.equal(
+      store.isTonyScratchPath(".pi-duo/tmp/tony/../../../src/review.js"),
+      false,
+    );
+    assert.equal(store.isTonyScratchPath(store.tonyScratchDir), false);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("shared context exposes durable review state", async () => {
+  const { cwd, store } = await fixture();
+  try {
+    const state = await store.update((draft) => {
+      draft.review = {
+        userTurn: 3,
+        status: "pending",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      };
+    });
+    assert.match(formatSharedContext(state), /Tony review: pending \(user turn 3\)/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("serializes concurrent state mutations without lost updates", async () => {
   const { cwd, store } = await fixture();
   try {
@@ -102,6 +155,60 @@ test("serializes concurrent state mutations without lost updates", async () => {
     const state = await store.readState();
     assert.equal(state?.todo.length, 12);
     assert.equal(state?.revision, 12);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("user-turn audit sequence survives reload and migrates legacy state", async () => {
+  const { cwd, store } = await fixture();
+  try {
+    assert.equal(await store.advanceUserTurn(), 1);
+    assert.equal(await new DuoStore(cwd).advanceUserTurn(), 2);
+
+    await store.update((state) => {
+      delete state.userTurn;
+    });
+    await store.appendMessage({
+      from: "austin",
+      to: "tony",
+      content: "legacy audit entry",
+      importance: "important",
+      userTurn: 7,
+    });
+    assert.equal(await new DuoStore(cwd).advanceUserTurn(), 8);
+    assert.equal((await store.readState())?.userTurn, 8);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("recent peer context is scoped to the current Duo run", async () => {
+  const { cwd, store } = await fixture();
+  try {
+    await writeFile(
+      store.messagesPath,
+      `${JSON.stringify({
+        id: "old",
+        from: "tony",
+        to: "austin",
+        content: "previous run",
+        importance: "important",
+        timestamp: "2000-01-01T00:00:00.000Z",
+        userTurn: 99,
+      })}\n`,
+    );
+    await store.appendMessage({
+      from: "tony",
+      to: "austin",
+      content: "current run",
+      importance: "important",
+      userTurn: 1,
+    });
+    const messages = await store.recentMessages();
+    assert.deepEqual(messages.map((message) => message.content), [
+      "current run",
+    ]);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -193,6 +300,18 @@ test("similarity and shell mutation checks are conservative", () => {
     isMutatingShell("node - <<'NODE'\nif (value > 1) console.log(value);\nNODE"),
     false,
   );
+  assert.equal(
+    isMutatingShell(
+      `node -e "require('node:fs').writeFileSync('owned.txt','x')"`,
+    ),
+    true,
+  );
+  assert.equal(
+    isMutatingShell(`python3 -c "open('owned.txt','w').write('x')"`),
+    true,
+  );
+  assert.equal(isMutatingShell("printf x | dd of=owned.txt"), true);
+  assert.equal(isMutatingShell("ln -s source target"), true);
   assert.equal(isMutatingShell("bash -c 'printf x > file'"), true);
   assert.equal(isMutatingShell(`printf "%s\\n" "bash -c 'rm file'"`), false);
   assert.equal(isMutatingShell("git status"), false);

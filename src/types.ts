@@ -42,9 +42,19 @@ export interface DuoAgentState {
   sessionFile?: string;
 }
 
+export interface DuoReviewState {
+  userTurn: number;
+  status: "pending" | "reported" | "failed";
+  startedAt: string;
+  updatedAt: string;
+  error?: string;
+}
+
 export interface DuoState {
   version: 1;
   revision: number;
+  /** Durable audit sequence. Optional only for states created before v0.1.0 migration. */
+  userTurn?: number;
   sessionId: string;
   goal: string;
   todo: TodoItem[];
@@ -52,7 +62,11 @@ export interface DuoState {
   agents: { austin: DuoAgentState; tony: DuoAgentState };
   status: "active" | "stopped";
   workspaceOwner: AgentId | null;
+  review?: DuoReviewState;
   peerMessageCount: number;
+  /** Durable counts of messages sent across the Austin ↔ Tony control plane. */
+  austinPeerMessageCount: number;
+  tonyPeerMessageCount: number;
   createdAt: string;
   updatedAt: string;
   lastActivityAt: string;

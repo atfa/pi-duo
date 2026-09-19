@@ -36,12 +36,26 @@ export function controlPlaneDelivery(
     : { triggerTurn: true };
 }
 
+export function shouldInspectPeerOutcome(wasStreaming: boolean): boolean {
+  // A steer has only been accepted into the active turn. It has not produced
+  // a completed outcome yet, so inspecting it here can create a false empty
+  // response failure.
+  return !wasStreaming;
+}
+
 export type WorkspaceAction = "status" | "acquire" | "release" | "transfer";
 
 export function roleDescription(actor: AgentId): string {
   return actor === "austin"
     ? "Austin (foreground agent; not Tony)"
     : "Tony (background peer; not Austin)";
+}
+
+export function parseAgentTarget(value: string | undefined): AgentId | undefined {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "austin" || normalized === "tony"
+    ? normalized
+    : undefined;
 }
 
 export function canMutateWorkspace(
@@ -73,6 +87,71 @@ export function workspaceHandoffRecipient(
   return workspaceOwner === peer ? peer : undefined;
 }
 
+export function openCompletionTodoIds(state: {
+  todo: Array<{
+    id: number;
+    status: "pending" | "in_progress" | "done" | "blocked";
+    owner?: AgentId;
+  }>;
+}): number[] {
+  return state.todo
+    .filter(
+      (item) =>
+        (item.status === "pending" || item.status === "in_progress"),
+    )
+    .map((item) => item.id);
+}
+
+export function completionGateNotice(state: {
+  review?: { status: "pending" | "reported" | "failed" };
+  todo: Array<{
+    id: number;
+    status: "pending" | "in_progress" | "done" | "blocked";
+    owner?: AgentId;
+  }>;
+}): string | undefined {
+  if (state.review?.status === "pending") {
+    return "Duo review pending: this is a preliminary Austin result, not the final reviewed outcome. Tony is still working and will wake Austin when the first review report is ready.";
+  }
+  const ids = openCompletionTodoIds(state);
+  if (ids.length) {
+    return `Duo completion pending: shared todo ${ids.map((id) => `#${id}`).join(", ")} still need reconciliation before the result is final.`;
+  }
+  return undefined;
+}
+
+export function canCompleteReview(
+  actor: AgentId,
+  explicitlyComplete: boolean | undefined,
+  status: "pending" | "reported" | "failed" | undefined,
+): boolean {
+  return actor === "tony" && explicitlyComplete === true && status === "pending";
+}
+
+export function reviewBelongsToTurn(
+  activeTonyUserTurn: number | undefined,
+  reviewUserTurn: number | undefined,
+): boolean {
+  return (
+    activeTonyUserTurn !== undefined &&
+    reviewUserTurn !== undefined &&
+    activeTonyUserTurn === reviewUserTurn
+  );
+}
+
+export function blocksDuoRestart(state: {
+  status: "active" | "stopped";
+  review?: { status: "pending" | "reported" | "failed" };
+} | undefined): boolean {
+  return state?.status === "active" && state.review?.status === "pending";
+}
+
+export function canMutateDuoState(
+  status: "active" | "stopped" | undefined,
+): boolean {
+  return status === "active";
+}
+
 export interface LoopGuardBlock {
   reason: string;
   persistWithoutTurn: boolean;
@@ -84,8 +163,8 @@ export class LoopGuard {
   private deferredThisTurn = 0;
   private consecutivePeerTurns = 0;
 
-  beginUserTurn(): number {
-    this.userTurn += 1;
+  beginUserTurn(durableTurn?: number): number {
+    this.userTurn = durableTurn ?? this.userTurn + 1;
     this.sentThisTurn = 0;
     this.deferredThisTurn = 0;
     this.consecutivePeerTurns = 0;

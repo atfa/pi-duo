@@ -4,12 +4,20 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  blocksDuoRestart,
+  canCompleteReview,
+  canMutateDuoState,
   canMutateWorkspace,
   canUseWorkspaceAction,
+  completionGateNotice,
   controlPlaneDelivery,
   dispatchControlPlaneTask,
   LoopGuard,
+  openCompletionTodoIds,
+  parseAgentTarget,
+  reviewBelongsToTurn,
   roleDescription,
+  shouldInspectPeerOutcome,
   triggeringDelivery,
   workspaceHandoffRecipient,
 } from "../src/coordinator.js";
@@ -61,9 +69,27 @@ test("control-plane tasks dispatch without waiting for the peer turn", async () 
   assert.equal(synchronousCaught, synchronous);
 });
 
+test("steered peer deliveries are not mistaken for completed empty turns", () => {
+  assert.equal(shouldInspectPeerOutcome(false), true);
+  assert.equal(shouldInspectPeerOutcome(true), false);
+});
+
 test("role descriptions make the current identity unambiguous", () => {
   assert.equal(roleDescription("austin"), "Austin (foreground agent; not Tony)");
   assert.equal(roleDescription("tony"), "Tony (background peer; not Austin)");
+});
+
+test("targeted stop agent names are case-insensitive", () => {
+  assert.equal(parseAgentTarget("austin"), "austin");
+  assert.equal(parseAgentTarget("Austin"), "austin");
+  assert.equal(parseAgentTarget("AUSTIN"), "austin");
+  assert.equal(parseAgentTarget("aUsTiN"), "austin");
+  assert.equal(parseAgentTarget("tony"), "tony");
+  assert.equal(parseAgentTarget("Tony"), "tony");
+  assert.equal(parseAgentTarget("TONY"), "tony");
+  assert.equal(parseAgentTarget("tOnY"), "tony");
+  assert.equal(parseAgentTarget("unknown"), undefined);
+  assert.equal(parseAgentTarget(undefined), undefined);
 });
 
 test("Austin-only policy fixes project writes to Austin", () => {
@@ -76,6 +102,12 @@ test("Austin-only policy fixes project writes to Austin", () => {
   assert.equal(canUseWorkspaceAction("austin-only", "austin", "transfer"), false);
   assert.equal(canUseWorkspaceAction("austin-only", "tony", "acquire"), false);
   assert.equal(canUseWorkspaceAction("transferable", "tony", "transfer"), true);
+});
+
+test("stopped Duo state is read-only until resumed", () => {
+  assert.equal(canMutateDuoState("active"), true);
+  assert.equal(canMutateDuoState("stopped"), false);
+  assert.equal(canMutateDuoState(undefined), false);
 });
 
 test("workspace handoffs route symmetrically through the control plane", () => {
@@ -95,6 +127,88 @@ test("workspace handoffs route symmetrically through the control plane", () => {
     triggerTurn: true,
     deliverAs: "steer",
   });
+});
+
+test("completion gate distinguishes pending review from stale shared todos", () => {
+  const todo = [
+    {
+      id: 1,
+      text: "implemented",
+      status: "done" as const,
+      owner: "austin" as const,
+    },
+    {
+      id: 2,
+      text: "verify",
+      status: "in_progress" as const,
+      owner: "austin" as const,
+    },
+    {
+      id: 3,
+      text: "peer task",
+      status: "pending" as const,
+      owner: "tony" as const,
+    },
+    {
+      id: 4,
+      text: "known blocker",
+      status: "blocked" as const,
+      owner: "austin" as const,
+    },
+  ];
+  assert.deepEqual(openCompletionTodoIds({ todo }), [2, 3]);
+  assert.match(
+    completionGateNotice({ review: { status: "pending" }, todo }) ?? "",
+    /preliminary.*Tony is still working/i,
+  );
+  assert.match(
+    completionGateNotice({ review: { status: "reported" }, todo }) ?? "",
+    /#2/,
+  );
+  assert.equal(
+    completionGateNotice({
+      review: { status: "reported" },
+      todo: todo.map((item) =>
+        item.id === 2 || item.id === 3
+          ? { ...item, status: "done" as const }
+          : item,
+      ),
+    }),
+    undefined,
+  );
+});
+
+test("only Tony's explicit report can complete a pending review", () => {
+  assert.equal(canCompleteReview("tony", true, "pending"), true);
+  assert.equal(canCompleteReview("tony", false, "pending"), false);
+  assert.equal(canCompleteReview("tony", undefined, "pending"), false);
+  assert.equal(canCompleteReview("austin", true, "pending"), false);
+  assert.equal(canCompleteReview("tony", true, "reported"), false);
+  assert.equal(canCompleteReview("tony", true, "failed"), false);
+});
+
+test("Tony review reports are scoped to the user turn that started them", () => {
+  assert.equal(reviewBelongsToTurn(4, 4), true);
+  assert.equal(reviewBelongsToTurn(3, 4), false);
+  assert.equal(reviewBelongsToTurn(undefined, 4), false);
+  assert.equal(reviewBelongsToTurn(4, undefined), false);
+});
+
+test("a pending review cannot be silently replaced by a new Duo run", () => {
+  assert.equal(
+    blocksDuoRestart({ status: "active", review: { status: "pending" } }),
+    true,
+  );
+  assert.equal(
+    blocksDuoRestart({ status: "active", review: { status: "reported" } }),
+    false,
+  );
+  assert.equal(
+    blocksDuoRestart({ status: "active", review: { status: "failed" } }),
+    false,
+  );
+  assert.equal(blocksDuoRestart({ status: "stopped" }), false);
+  assert.equal(blocksDuoRestart(undefined), false);
 });
 
 test("loop guard enforces duplicate, total, and consecutive limits", async () => {
@@ -225,4 +339,11 @@ test("loop guard enforces duplicate, total, and consecutive limits", async () =>
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+test("loop guard resumes a durable user-turn sequence after reload", () => {
+  const guard = new LoopGuard();
+  assert.equal(guard.beginUserTurn(7), 7);
+  assert.equal(guard.turn, 7);
+  assert.equal(guard.beginUserTurn(8), 8);
 });

@@ -39,4 +39,6 @@ test("extension registers commands, tools, renderer, and lifecycle hooks without
   assert.ok(events.includes("before_agent_start"));
   assert.ok(events.includes("input"));
   assert.ok(events.includes("tool_call"));
+  assert.ok(events.includes("message_end"));
+  assert.ok(events.includes("agent_end"));
 });

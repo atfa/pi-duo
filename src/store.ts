@@ -26,6 +26,41 @@ export const DEFAULT_CONFIG: DuoConfig = {
   writePolicy: "austin-only",
 };
 
+export const MIN_PEER_MESSAGES_PER_TURN = 4;
+
+export function normalizeConfig(config: DuoConfig): DuoConfig {
+  const normalized = { ...config };
+  if (
+    !Number.isSafeInteger(normalized.maxPeerMessagesPerTurn) ||
+    normalized.maxPeerMessagesPerTurn < MIN_PEER_MESSAGES_PER_TURN
+  )
+    normalized.maxPeerMessagesPerTurn = MIN_PEER_MESSAGES_PER_TURN;
+  if (
+    !Number.isSafeInteger(normalized.maxDeferredMessagesPerTurn) ||
+    normalized.maxDeferredMessagesPerTurn < 0
+  )
+    normalized.maxDeferredMessagesPerTurn =
+      DEFAULT_CONFIG.maxDeferredMessagesPerTurn;
+  if (
+    !Number.isSafeInteger(normalized.maxConsecutivePeerTurns) ||
+    normalized.maxConsecutivePeerTurns < 1
+  )
+    normalized.maxConsecutivePeerTurns =
+      DEFAULT_CONFIG.maxConsecutivePeerTurns;
+  if (
+    !Number.isFinite(normalized.similarityThreshold) ||
+    normalized.similarityThreshold < 0 ||
+    normalized.similarityThreshold > 1
+  )
+    normalized.similarityThreshold = DEFAULT_CONFIG.similarityThreshold;
+  if (
+    normalized.writePolicy !== "austin-only" &&
+    normalized.writePolicy !== "transferable"
+  )
+    normalized.writePolicy = DEFAULT_CONFIG.writePolicy;
+  return normalized;
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const now = () => new Date().toISOString();
 
@@ -43,6 +78,7 @@ export class DuoStore {
   readonly configPath: string;
   readonly messagesPath: string;
   readonly decisionsPath: string;
+  readonly tonyScratchDir: string;
   private readonly lockPath: string;
 
   constructor(cwd: string) {
@@ -51,11 +87,29 @@ export class DuoStore {
     this.configPath = path.join(this.dir, "config.json");
     this.messagesPath = path.join(this.dir, "messages.jsonl");
     this.decisionsPath = path.join(this.dir, "decisions.md");
+    this.tonyScratchDir = path.join(this.dir, "tmp", "tony");
     this.lockPath = path.join(this.dir, ".lock");
   }
 
   async ensure(): Promise<void> {
     await mkdir(this.dir, { recursive: true });
+  }
+
+  async ensureTonyScratch(): Promise<void> {
+    await mkdir(this.tonyScratchDir, { recursive: true });
+  }
+
+  isTonyScratchPath(candidate: string): boolean {
+    if (!candidate.trim()) return false;
+    const projectDir = path.dirname(this.dir);
+    const resolved = path.resolve(projectDir, candidate);
+    const relative = path.relative(this.tonyScratchDir, resolved);
+    return (
+      relative !== "" &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative)
+    );
   }
 
   async readConfig(): Promise<DuoConfig> {
@@ -64,13 +118,7 @@ export class DuoStore {
       const parsed = JSON.parse(
         await readFile(this.configPath, "utf8"),
       ) as Partial<DuoConfig>;
-      const config = { ...DEFAULT_CONFIG, ...parsed };
-      if (
-        config.writePolicy !== "austin-only" &&
-        config.writePolicy !== "transferable"
-      )
-        config.writePolicy = DEFAULT_CONFIG.writePolicy;
-      return config;
+      return normalizeConfig({ ...DEFAULT_CONFIG, ...parsed });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       return { ...DEFAULT_CONFIG };
@@ -80,13 +128,40 @@ export class DuoStore {
   async writeConfig(config: DuoConfig): Promise<void> {
     await this.atomicWrite(
       this.configPath,
-      JSON.stringify(config, null, 2) + "\n",
+      JSON.stringify(normalizeConfig(config), null, 2) + "\n",
     );
   }
 
   async readState(): Promise<DuoState | undefined> {
     try {
-      return JSON.parse(await readFile(this.statePath, "utf8")) as DuoState;
+      const state = JSON.parse(await readFile(this.statePath, "utf8")) as DuoState;
+      // Backfill directional counters for states created before this metric
+      // existed. Counts are derived only from this Duo run's audit messages.
+      if (
+        state.austinPeerMessageCount === undefined ||
+        state.tonyPeerMessageCount === undefined
+      ) {
+        try {
+          const lines = (await readFile(this.messagesPath, "utf8"))
+            .trim()
+            .split("\n")
+            .filter(Boolean);
+          let austin = 0;
+          let tony = 0;
+          for (const line of lines) {
+            const message = JSON.parse(line) as PeerMessage;
+            if (message.timestamp < state.createdAt) continue;
+            if (message.from === "austin") austin++;
+            if (message.from === "tony") tony++;
+          }
+          state.austinPeerMessageCount ??= austin;
+          state.tonyPeerMessageCount ??= tony;
+        } catch {
+          state.austinPeerMessageCount ??= 0;
+          state.tonyPeerMessageCount ??= 0;
+        }
+      }
+      return state;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
@@ -111,6 +186,7 @@ export class DuoStore {
     const state: DuoState = {
       version: 1,
       revision: 0,
+      userTurn: 0,
       sessionId: randomUUID(),
       goal: "",
       todo: [],
@@ -126,6 +202,8 @@ export class DuoStore {
       status: "active",
       workspaceOwner: "austin",
       peerMessageCount: 0,
+      austinPeerMessageCount: 0,
+      tonyPeerMessageCount: 0,
       createdAt: timestamp,
       updatedAt: timestamp,
       lastActivityAt: timestamp,
@@ -168,6 +246,34 @@ export class DuoStore {
     });
   }
 
+  /**
+   * Atomically advances the audit sequence. For legacy states, recover the
+   * high-water mark from both review state and the complete message log.
+   */
+  async advanceUserTurn(): Promise<number> {
+    return this.withLock(async () => {
+      const state = await this.readState();
+      if (!state) throw new Error("Duo has not been started");
+      let highWaterMark = Math.max(
+        Number.isSafeInteger(state.userTurn) ? state.userTurn ?? 0 : 0,
+        state.review?.userTurn ?? 0,
+      );
+      for (const message of await this.recentMessages(Number.MAX_SAFE_INTEGER)) {
+        if (Number.isSafeInteger(message.userTurn))
+          highWaterMark = Math.max(highWaterMark, message.userTurn);
+      }
+      state.userTurn = highWaterMark + 1;
+      state.revision += 1;
+      state.updatedAt = now();
+      state.lastActivityAt = state.updatedAt;
+      await this.atomicWrite(
+        this.statePath,
+        JSON.stringify(state, null, 2) + "\n",
+      );
+      return state.userTurn;
+    });
+  }
+
   async appendMessage(
     message: Omit<PeerMessage, "id" | "timestamp">,
   ): Promise<PeerMessage> {
@@ -187,6 +293,12 @@ export class DuoStore {
       const state = await this.readState();
       if (state) {
         state.peerMessageCount += 1;
+        if (full.from === "austin")
+          state.austinPeerMessageCount =
+            (state.austinPeerMessageCount ?? 0) + 1;
+        else
+          state.tonyPeerMessageCount =
+            (state.tonyPeerMessageCount ?? 0) + 1;
         state.revision += 1;
         state.updatedAt = full.timestamp;
         state.lastActivityAt = full.timestamp;
@@ -201,11 +313,18 @@ export class DuoStore {
 
   async recentMessages(limit = 20): Promise<PeerMessage[]> {
     try {
+      const state = await this.readState();
+      const createdAt = state?.createdAt;
       const lines = (await readFile(this.messagesPath, "utf8"))
         .trim()
         .split("\n")
         .filter(Boolean);
-      return lines.slice(-limit).map((line) => JSON.parse(line) as PeerMessage);
+      return lines
+        .map((line) => JSON.parse(line) as PeerMessage)
+        .filter(
+          (message) => !createdAt || message.timestamp >= createdAt,
+        )
+        .slice(-limit);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
@@ -276,7 +395,10 @@ export function formatSharedContext(state: DuoState): string {
       .slice(-8)
       .map((d) => `- #${d.id} ${d.text}`)
       .join("\n") || "- (none)";
-  return `## Duo shared state (revision ${state.revision})\nGOAL\n${state.goal || "(not set)"}\n\nTODO\n${todos}\n\nDURABLE DECISIONS\n${decisions}\n\nWorkspace write owner: ${state.workspaceOwner ?? "none"}`;
+  const review = state.review
+    ? `${state.review.status} (user turn ${state.review.userTurn})${state.review.error ? ` — ${state.review.error}` : ""}`
+    : "not started";
+  return `## Duo shared state (revision ${state.revision})\nGOAL\n${state.goal || "(not set)"}\n\nTODO\n${todos}\n\nDURABLE DECISIONS\n${decisions}\n\nTony review: ${review}\nWorkspace write owner: ${state.workspaceOwner ?? "none"}`;
 }
 
 export function textSimilarity(a: string, b: string): number {
@@ -366,11 +488,14 @@ function quotedShellScripts(command: string): string[] {
 export function isMutatingShell(command: string): boolean {
   if (quotedShellScripts(command).some((script) => isMutatingShell(script)))
     return true;
+  const inlineInterpreterWrite =
+    /\b(?:node|python(?:3)?|ruby|perl)\b[\s\S]*?(?:writeFile(?:Sync)?|appendFile(?:Sync)?|createWriteStream|\.write_text\s*\(|\.write_bytes\s*\(|\bopen\s*\([^)]*,\s*["'][wax+]|File\.(?:write|open)|syswrite|\bunlink\s*\(|\brename\s*\(|\bmkdir\s*\()/iu;
+  if (inlineInterpreterWrite.test(command)) return true;
   const visible = maskQuotedShellText(maskHereDocumentBodies(command));
   const withoutNonFileRedirects = visible
     .replace(/\d*>>?\s*\/dev\/null\b/gu, "")
     .replace(/\d*>\s*&\d+\b/gu, "");
-  return /(^|[;&|]\s*|\b)(rm|mv|cp|mkdir|rmdir|touch|chmod|chown|git\s+(add|commit|checkout|switch|reset|clean|merge|rebase|apply)|npm\s+(install|uninstall)|pnpm\s+(add|remove|install)|yarn\s+(add|remove|install)|tee|truncate)\b|(^|[^<=>])>>?(?!=)|\bsed\s+-i\b/iu.test(
+  return /(^|[;&|]\s*|\b)(rm|mv|cp|mkdir|rmdir|touch|chmod|chown|install|ln|git\s+(add|commit|checkout|switch|reset|clean|merge|rebase|apply)|npm\s+(install|uninstall)|pnpm\s+(add|remove|install)|yarn\s+(add|remove|install)|tee|truncate)\b|(^|[^<=>])>>?(?!=)|\bsed\s+-i\b|\bperl\s+-[^\s]*i|\bdd\b[^\n;&|]*\bof\s*=/iu.test(
     withoutNonFileRedirects,
   );
 }

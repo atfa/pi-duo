@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/atfa/pi-duo"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-atfa%2Fpi--duo-181717?logo=github"></a>
   <img alt="Pi" src="https://img.shields.io/badge/Pi-%E2%89%A5%200.85.1-7C3AED">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.1.0_beta-00C2A8">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.2.0_beta-00C2A8">
   <img alt="Tests" src="https://img.shields.io/badge/tests-15%20passing-22C55E">
 </p>
 
@@ -45,6 +45,7 @@ flowchart LR
 - **可选模型组合**：两个角色可以使用同一模型，也可以使用不同 provider/model。
 - **真实 context 通信**：`duo_send` 把消息写入 peer 的持久会话。
 - **后台自动协作**：默认每条普通用户任务都会同时派发给 Tony。
+- **审查完成门控**：Tony 首份报告到达前，Austin 的终稿会明确标为预备结果；报告到达后自动唤醒 Austin 收口。
 - **共享工作面**：goal、todo、decisions、消息审计和 workspace owner 持久化在项目内。
 - **默认单写者**：`austin-only` 模式固定 Austin 为项目文件写入者。
 - **高级可转移写锁**：`transferable` 模式允许双方显式交接 workspace ownership。
@@ -106,6 +107,13 @@ npm install
 pi install "$PWD"
 ```
 
+如果此前安装过 GitHub 版本，请先移除它再安装 checkout；`/reload` 只会重载当前已安装的来源，不会自动切换到本地源码：
+
+```bash
+pi remove git:github.com/atfa/pi-duo
+pi install "$PWD"
+```
+
 也可以使用 Pi extension discovery 的符号链接方式：
 
 ```bash
@@ -114,6 +122,8 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-duo
 ```
 
 修改源码后在 Pi 中运行 `/reload`。
+
+若当前 Duo 仍有 `pending` review，新的 `/duo start` 会被拒绝，避免静默丢失正在进行的审查。确实要放弃当前运行时，先执行 `/duo stop`，再重新 `/duo start`。
 
 ## 5 分钟快速开始
 
@@ -134,7 +144,7 @@ pi
 
 ### 2. 选择 Austin 的模型
 
-Austin 就是当前前台 Pi。先用 Pi 的模型选择功能选好 Austin 的模型。
+Austin 就是当前前台 Pi。先用 Pi 的模型选择功能选好 Austin 的模型。执行 `/duo start` 时，当前模型会写入 `config.json` 的 `agentA`；旧配置不会阻止切换模型。
 
 ### 3. 启动 Duo
 
@@ -184,14 +194,23 @@ Workspace write owner: Austin
 
 ## `/duo` 命令完整说明
 
+### Duo 模式的边界
+
+安装或加载扩展不会自动进入 Duo 模式。`/duo start` 会创建 Duo 状态，并把当前 Pi session 绑定为 Austin；只有这个 session 会显示 Duo 状态、注入协作提示并自动调度 Tony。同一工作目录中其他普通 Pi session 不会继承这些行为。
+
+不带 agent 名称的 `/duo stop` 会完整退出 Duo 模式、中止双方当前回合并清除状态提示。之后可用 `/duo resume` 回到已保存的 Austin session 并重新进入 Duo 模式。`/duo stop austin` 和 `/duo stop tony` 只是定向中止其中一方，不退出整个 Duo 模式。
+
 ### 查看状态
 
 ```text
 /duo
 /duo status
+/duo history
 ```
 
-显示运行状态、当前角色、共享目标、todo 进度、两个模型/session、写入策略、workspace owner、消息数和最后活动时间。
+显示运行状态、当前角色、共享目标、todo 进度、两个模型/session、写入策略、workspace owner、消息总数，以及 Austin → Tony、Tony → Austin 各自通过控制面发送的消息次数和最后活动时间。这里的次数只统计双方实际发给对方的 Duo 消息，不统计模型内部思考或工具调用。
+
+`/duo history` 打开当前 Duo 回合的聊天式消息历史：Austin 发出的内容靠左，Tony 发出的内容靠右。按 `ESC` 关闭历史视图并返回 Pi。
 
 ### 创建新的 Duo
 
@@ -203,9 +222,9 @@ Workspace write owner: Austin
 ```
 
 - 当前 Pi session 成为 Austin；
+- 当前前台模型成为 Austin，并自动覆盖 `config.json` 中旧的 `agentA`；
 - `--peer` 指定 Tony 模型；省略时使用 `config.json` 的 `agentB`，仍未配置则弹出模型选择器；
 - `--goal` 设置初始共享目标；
-- Austin 当前模型必须与已配置的 `agentA` 一致。
 
 > **注意**：`/duo start` 创建新的共享 Duo 状态。已有会话应优先使用 `/duo resume`，避免重新初始化 goal、todo 和 decisions。
 
@@ -213,9 +232,13 @@ Workspace write owner: Austin
 
 ```text
 /duo stop
+/duo stop austin
+/duo stop tony
 ```
 
-停止后台 Tony，但保留 Austin/Tony session 和全部 `.pi-duo` 状态。
+`/duo stop` 会立即中止双方并把 Duo 标记为 stopped。`/duo stop austin` 只中止 Austin 当前前台回合，Tony 与 Duo 保持运行；`/duo stop tony` 只中止 Tony，并把当前 pending review 明确标为 failed，Austin 与 Duo 保持运行。Agent 名称不区分大小写（例如 `AUSTIN`、`Tony`、`tOnY` 均有效）。
+
+三种停止方式都会保留 Austin/Tony session 和全部 `.pi-duo` 状态。
 
 ### 恢复
 
@@ -280,11 +303,11 @@ Workspace write owner: Austin
 
 | 配置项 | 默认值 | `/duo config` | 说明 |
 | --- | --- | --- | --- |
-| `agentA` | 首次启动时记录 | 否 | Austin 的 `{provider, modelId}`。Austin 是当前前台模型。 |
+| `agentA` | 启动时记录 | 否 | Austin 的 `{provider, modelId}`；每次 `/duo start` 都以当前前台模型自动更新。 |
 | `agentB` | 交互选择或 `--peer` | 否 | Tony 的 `{provider, modelId}`。 |
 | `autoDispatch` | `true` | 是 | `true`：每个普通用户任务自动派发给 Tony；`false`：只在 Austin 显式调用 `duo_send` 时联系 Tony。 |
 | `writePolicy` | `"austin-only"` | 是 | `austin-only` 或 `transferable`，详见下文。 |
-| `maxPeerMessagesPerTurn` | `6` | 是 | 每个用户回合最多触发多少条 peer 消息。最后一个触发槽保留给 `important`/`decision`。 |
+| `maxPeerMessagesPerTurn` | `6` | 是 | 每个用户回合最多触发多少条 peer 消息，最小值为 `4`，避免审查、修复和复验闭环因配置而死锁。最后一个触发槽保留给 `important`/`decision`。 |
 | `maxDeferredMessagesPerTurn` | `2` | 是 | 触发预算耗尽后，额外允许持久化多少条高优先级消息；这些消息不会立即启动新模型回合。 |
 | `maxConsecutivePeerTurns` | `3` | 是 | 没有实质工具活动时，允许连续发生的 peer-only 消息数量。 |
 | `similarityThreshold` | `0.9` | 是 | `0–1` 相似度阈值；消息相似度达到阈值即抑制。越低越激进，越高越只拦截近似重复。 |
@@ -339,14 +362,24 @@ NODE
 
 ### `duo_send`
 
+普通 `duo_send` 只表示阶段性协作，不会结束审查。Tony 只有在当前交付物已经存在、并完成独立检查和验证后，才使用 `reviewComplete=true` 提交汇总报告；该显式报告会把 review 标记为 `reported` 并唤醒 Austin。这样，前期规格建议不会被误判为最终审查。
+
+Tony 在后台审查时，Pi 的页脚和输入框下方会持续显示无边框状态面板。Tony 提出修改、最终完成或审查失败时，指示会分别切换为待修复、完成或失败状态，避免 Austin 回到提示符后被误认为整个 Duo 已结束。状态面板不绘制固定宽度框线，以兼容不同终端对中英文字符宽度的处理。
+
+Tony 发出消息后必须结束当前回合，后续工具调用会被控制面拦截，直到 Austin 投递新工作。若审查发现需要修改的问题，Tony 使用 `reviewFinding=true` 发送一次汇总报告：它会绕过普通消息预算并唤醒 Austin，但 review 继续保持 `pending`。
+
 向 peer 的真实持久 context 发送精选消息。
 
 参数：
 
 - `message`：消息正文；
 - `importance`：`normal`、`important` 或 `decision`。
+- `reviewComplete`：仅 Tony 使用；只有完成对当前交付物的独立验证后才设为 `true`。
+- `reviewFinding`：仅 Tony 使用；发现需要 Austin 修改的问题时设为 `true`，强制唤醒 Austin，但不结束 review。
 
 `important` 和 `decision` 可以使用保留槽，并在总预算耗尽后进入 deferred 持久化槽。
+
+向 Tony 投递时工具会立即返回，不等待 Tony 跑完整个模型回合。Tony 的结果会作为后续 peer message 自动唤醒 Austin，因此 Austin 不应轮询或重复发送同一请求。
 
 ### `duo_status`
 
@@ -438,7 +471,7 @@ Austin 的原生 session 仍保存在 Pi 的正常 session 目录中；`state.js
 - pi-duo 是 Pi extension，不是容器、VM 或 OS 权限沙箱；
 - shell 分类器只能阻止可识别的写命令；测试、构建和任意脚本仍可能创建文件；
 - `austin-only` 是协作纪律和工具保护，不是恶意代码隔离；
-- 默认也会阻止 Tony 创建可识别的 `/tmp` 临时文件。可改用 inline/stdin 测试；
+- Tony 可通过 `write`/`edit` 在 `.pi-duo/tmp/tony/` 创建一次性测试 harness，再用只读 shell 命令运行；项目文件写入仍会被阻止；
 - 两个 Agent 共享同一个工作目录，不提供自动 Git worktree；
 - 当前 UI 只显示前台 Austin，Tony 在后台运行；
 - deferred 消息不会立即触发模型回合；
@@ -478,11 +511,15 @@ Austin 的原生 session 仍保存在 Pi 的正常 session 目录中；`state.js
 
 ### Tony 的 shell 命令被阻止
 
-默认 `austin-only` 会拦截可识别写命令。Tony 应改用只读检查、inline 脚本，并把建议发给 Austin。确实需要 Tony 写入时，再显式切换到 `transferable` 并交接 ownership。
+默认 `austin-only` 会拦截可识别写命令。Tony 应改用只读检查，或用 `write`/`edit` 把一次性 harness 写到 `.pi-duo/tmp/tony/` 后运行，并把建议发给 Austin。确实需要 Tony 修改项目文件时，再显式切换到 `transferable` 并交接 ownership。
 
 ### todo 已完成但状态仍 pending
 
-Austin 应在最终回复前调用 `duo_todo update` 收敛共享状态。可以在新提示中要求：“完成前核对并关闭所有共享 todo”。
+pi-duo 会把带有 `pending`/`in_progress` 共享 todo 的终稿标为尚未完成，并自动追加一次收口回合。Austin 应调用 `duo_todo update`：已完成项标为 `done`，确实未完成的项保留为 `pending` 或 `blocked` 并向用户说明。
+
+### Austin 显示 preliminary / Tony review pending
+
+这表示 Austin 已产生阶段性结果，但 Tony 的当前自动审查尚未返回。它不是最终完成信号。Tony 首份报告到达后会自动唤醒 Austin；无需发送新提示，也不要让 Austin 用 sleep/poll 等待。
 
 ### 如何查看协作是否真实发生？
 
@@ -522,7 +559,7 @@ assets/pi-duo-xhs.png    3:4 宣传图
 
 ## 项目状态
 
-当前定位：**v0.1.0 beta / release candidate**。
+当前定位：**v0.2.0 beta / release candidate**。
 
 已经过以下真实场景验证：
 

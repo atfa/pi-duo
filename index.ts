@@ -6,17 +6,27 @@ import {
   SessionManager,
   type AgentSession,
   type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionUIContext,
   type ModelRegistry,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
+  blocksDuoRestart,
+  canCompleteReview,
+  canMutateDuoState,
   canMutateWorkspace,
   canUseWorkspaceAction,
   controlPlaneDelivery,
+  completionGateNotice,
   dispatchControlPlaneTask,
   LoopGuard,
+  openCompletionTodoIds,
+  parseAgentTarget,
+  reviewBelongsToTurn,
   roleDescription,
+  shouldInspectPeerOutcome,
   triggeringDelivery,
   workspaceHandoffRecipient,
 } from "./src/coordinator.js";
@@ -25,6 +35,7 @@ import {
   formatSharedContext,
   isMutatingShell,
   isWaitingShell,
+  MIN_PEER_MESSAGES_PER_TURN,
   otherAgent,
   parseModelRef,
 } from "./src/store.js";
@@ -51,11 +62,12 @@ You are Austin, the foreground agent. Tony is the background peer. Never identif
 Before your final user-facing answer, reconcile the shared duo_todo list: mark completed work done and leave genuinely unfinished work pending or blocked.`
       : `## Fixed role identity
 You are Tony, the background peer. Austin is the foreground agent. Never identify yourself as Austin or spend a peer message asking the peer to confirm identities.
-Consolidate review findings instead of narrating every intermediate check. If shared todos are stale, tell Austin which items need reconciliation.`;
+Consolidate review findings instead of narrating every intermediate check. If shared todos are stale, tell Austin which items need reconciliation.
+A normal duo_send is preliminary coordination and does not finish the review. After any duo_send, end your turn immediately; the control plane will block further tools until Austin sends new work. If independent review finds actionable changes, send one consolidated report with reviewFinding=true so it reaches Austin even when the ordinary message budget is exhausted, while keeping review pending. Only after you have inspected the current deliverable and completed independent verification, send the consolidated final report with reviewComplete=true. Never set reviewComplete while files are absent, still changing, or awaiting a promised verification.`;
   const workspacePolicy =
     config.writePolicy === "austin-only"
       ? `## Austin-only write policy
-Austin is the sole writer of project files. Tony must not call edit/write, run recognizable workspace-mutating shell commands, request workspace ownership, or ask Austin to transfer it. Tony should work as an independent reader, investigator, tester, and reviewer. Consolidate findings into concise reports with file:line evidence, failure conditions, and acceptance tests. Austin should implement changes and request Tony review at material checkpoints. Shared .pi-duo state and Tony's own session persistence are exempt from this project-file policy.`
+Austin is the sole writer of project files. Tony must not modify project files, run recognizable workspace-mutating shell commands, request workspace ownership, or ask Austin to transfer it. Tony may use write/edit only inside .pi-duo/tmp/tony for disposable test harnesses; run them with read-only shell commands and leave project files untouched. Tony should work as an independent reader, investigator, tester, and reviewer. Consolidate findings into concise reports with file:line evidence, failure conditions, and acceptance tests. Austin should implement changes and request Tony review at material checkpoints. Shared .pi-duo state and Tony's own session persistence are exempt from this project-file policy.`
       : `## Transferable write policy
 Workspace ownership may move between Austin and Tony. A release or transfer wakes the peer in either direction; do not spend another peer message merely repeating that handoff.`;
   return `${BASE_POLICY}\n\n${identityPolicy}\n\n${workspacePolicy}`;
@@ -72,6 +84,18 @@ const SendSchema = Type.Object({
       Type.Literal("important"),
       Type.Literal("decision"),
     ]),
+  ),
+  reviewComplete: Type.Optional(
+    Type.Boolean({
+      description:
+        "Tony only: mark this consolidated report as the completed independent review of the current deliverable",
+    }),
+  ),
+  reviewFinding: Type.Optional(
+    Type.Boolean({
+      description:
+        "Tony only: send one consolidated actionable review report that must wake Austin while leaving the review pending",
+    }),
   ),
 });
 const GoalSchema = Type.Object({
@@ -160,7 +184,8 @@ function renderStatus(
     `Tony: ${modelText(stateModel(state, "tony"))} · session ${state.agents.tony.sessionId?.slice(0, 8) ?? "?"}`,
     `Write policy: ${config.writePolicy}`,
     `Workspace write owner: ${state.workspaceOwner ? agentName(state.workspaceOwner) : "none"}`,
-    `Peer messages: ${state.peerMessageCount}`,
+    `Tony review: ${state.review ? `${state.review.status} (user turn ${state.review.userTurn})` : "not started"}`,
+    `Peer messages: ${state.peerMessageCount} total · Austin → Tony ${state.austinPeerMessageCount ?? 0} · Tony → Austin ${state.tonyPeerMessageCount ?? 0}`,
     `Last activity: ${state.lastActivityAt}`,
   ].join("\n");
 }
@@ -221,9 +246,247 @@ export default function piDuo(pi: ExtensionAPI) {
   let tonyUnsubscribe: (() => void) | undefined;
   let tonyQueue: Promise<void> = Promise.resolve();
   let tonySentSequence = 0;
-  let lastTonyDelivery: { sequence: number; content: string } | undefined;
+  let tonyMustYield = false;
+  let activeTonyUserTurn: number | undefined;
+  let completionReconcileTurn = -1;
   let extensionActive = true;
   let lifecycleGeneration = 0;
+  let foregroundUI: ExtensionUIContext | undefined;
+  // An active Duo belongs to one concrete foreground Austin session. Merely
+  // opening another Pi session in the same cwd must not enable Duo behavior.
+  let foregroundDuoActive = false;
+  let reviewIndicatorPhase:
+    | "working"
+    | "waiting"
+    | "complete"
+    | "failed"
+    | "clear" = "clear";
+  let reviewIndicatorDetail = "";
+  let reviewIndicatorStartedAt = 0;
+  let reviewIndicatorFrame = 0;
+  let reviewIndicatorTimer: ReturnType<typeof setInterval> | undefined;
+  let austinPeerMessages = 0;
+  let tonyPeerMessages = 0;
+
+  const elapsedText = (startedAt: number) => {
+    const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds % 60;
+    return minutes
+      ? `${minutes}m ${String(remainder).padStart(2, "0")}s`
+      : `${remainder}s`;
+  };
+
+  const renderReviewIndicator = () => {
+    const ui = foregroundUI;
+    if (!ui) return;
+    if (reviewIndicatorPhase === "clear") {
+      ui.setStatus("pi-duo-review", undefined);
+      ui.setWidget("pi-duo-review", undefined, { placement: "belowEditor" });
+      return;
+    }
+    const frames = ["◐", "◓", "◑", "◒"];
+    const icon =
+      reviewIndicatorPhase === "working"
+        ? frames[reviewIndicatorFrame++ % frames.length]
+        : reviewIndicatorPhase === "waiting"
+          ? "↔"
+          : reviewIndicatorPhase === "complete"
+            ? "✓"
+            : "⚠";
+    const label =
+      reviewIndicatorPhase === "working"
+        ? "Tony 正在后台审查"
+        : reviewIndicatorPhase === "waiting"
+          ? "Tony 已提出修改，等待 Austin"
+          : reviewIndicatorPhase === "complete"
+            ? "Tony 最终审查已完成"
+            : "Tony 审查失败或被中断";
+    const elapsed = reviewIndicatorStartedAt
+      ? elapsedText(reviewIndicatorStartedAt)
+      : "—";
+    const austinModel = config?.agentA ? modelText(config.agentA) : "Austin";
+    const tonyModel = config?.agentB ? modelText(config.agentB) : "Tony";
+    const turn = activeTonyUserTurn ?? guard.turn;
+    ui.setStatus(
+      "pi-duo-review",
+      `${icon} ${label} · 回合 ${turn || "—"} · ${elapsed}`,
+    );
+    ui.setWidget(
+      "pi-duo-review",
+      [
+        `pi-duo · 双模型协作`,
+        `${icon} ${label}`,
+        `模型  ${austinModel} → ${tonyModel}`,
+        `交谈  Austin → Tony ${austinPeerMessages} · Tony → Austin ${tonyPeerMessages}`,
+        `进度  用户回合 ${turn || "—"} · 已用时 ${elapsed}${reviewIndicatorDetail ? ` · ${reviewIndicatorDetail}` : ""}`,
+        reviewIndicatorPhase === "working"
+          ? "提示  Pi 提示符返回不代表结束；Tony 完成后会自动唤醒 Austin"
+          : reviewIndicatorPhase === "waiting"
+            ? "提示  review 仍为 pending；Austin 修复后将自动重新交给 Tony"
+            : reviewIndicatorPhase === "complete"
+              ? "提示  review 已 reported；可以提交最终的双模型结论"
+              : "提示  不得声称已通过 Tony 复验；请检查错误或重新开始审查",
+      ],
+      { placement: "belowEditor" },
+    );
+  };
+
+  const setReviewIndicator = (
+    phase: "working" | "waiting" | "complete" | "failed" | "clear",
+    detail?: string,
+  ) => {
+    const wasActive =
+      reviewIndicatorPhase === "working" || reviewIndicatorPhase === "waiting";
+    reviewIndicatorPhase = phase;
+    reviewIndicatorDetail = detail ?? "";
+    if ((phase === "working" || phase === "waiting") && !wasActive)
+      reviewIndicatorStartedAt = Date.now();
+    if (phase === "clear") reviewIndicatorStartedAt = 0;
+    if (reviewIndicatorTimer) {
+      clearInterval(reviewIndicatorTimer);
+      reviewIndicatorTimer = undefined;
+    }
+    renderReviewIndicator();
+    if (phase === "working") {
+      reviewIndicatorTimer = setInterval(renderReviewIndicator, 800);
+      reviewIndicatorTimer.unref?.();
+    }
+  };
+
+  const showHistory = async (ctx: ExtensionCommandContext) => {
+    if (!foregroundUI || !store || ctx.mode !== "tui") {
+      ctx.ui.notify("/duo history requires TUI mode", "error");
+      return;
+    }
+    const messages = await store.recentMessages(Number.MAX_SAFE_INTEGER);
+    await foregroundUI.custom<void>((tui, _theme, _keybindings, done) => {
+      let scrollOffset = 0;
+      return {
+        render(width: number, height?: number) {
+          const panelWidth = Math.max(30, width);
+          const inner = Math.max(26, panelWidth - 2);
+          const bubbleWidth = Math.max(20, Math.floor(inner * 0.58));
+          const bodyWidth = Math.max(16, bubbleWidth - 4);
+          // TUI columns are wider for CJK characters. Wrapping by JS string
+          // length lets Chinese messages cross the frame and clips Tony's
+          // right-aligned bubbles. Keep every rendered line within `inner`.
+          const displayWidth = (value: string) =>
+            [...value].reduce((total, char) =>
+              total + (/[,\u1100-\u115f\u2e80-\u303e\u3040-\u30ff\u3130-\u318f\u31a0-\u31ff\u3400-\u4dbf\u4e00-\u9fff\ua960-\ua97f\uac00-\ud7ff\uf900-\ufaff\ufe10-\ufe6f\uff00-\uff60\uffe0-\uffe6]/u.test(char) ? 2 : 1), 0);
+          const wrap = (value: string) => {
+            const result: string[] = [];
+            let line = "";
+            let columns = 0;
+            for (const char of value) {
+              const charWidth = displayWidth(char);
+              if (line && columns + charWidth > bodyWidth) {
+                result.push(line);
+                line = "";
+                columns = 0;
+              }
+              line += char;
+              columns += charWidth;
+            }
+            if (line || !result.length) result.push(line);
+            return result;
+          };
+          const conversation: string[] = [];
+          for (const message of messages) {
+            const body = wrap(message.content.replace(/\s+/g, " ").trim());
+            const fromAustin = message.from === "austin";
+            const label = fromAustin ? "Austin" : "Tony";
+            const stamp = new Date(message.timestamp).toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+            });
+            const header = `${label}  ·  ${stamp}`;
+            conversation.push(
+              (fromAustin ? "  " : " ".repeat(Math.max(2, inner - header.length - 1))) +
+                _theme.fg(fromAustin ? "accent" : "success", header),
+              ...body.map((line) => {
+                const bodyIndent = fromAustin
+                  ? "  "
+                  : " ".repeat(Math.max(2, inner - bubbleWidth));
+                return bodyIndent + _theme.fg("text", `  ${line}`);
+              }),
+              "",
+            );
+          }
+          // Keep the frame fully visible even on short terminals. More
+          // messages remain available through ↑/↓ scrolling.
+          // `content` has five fixed lines (title, counters, scroll hint,
+          // spacer, footer) and the frame adds two borders. Reserve those
+          // rows so the bottom border is always inside the overlay viewport.
+          const maxVisible = Math.max(1, (height ?? 40) - 7);
+          const maxOffset = Math.max(0, conversation.length - maxVisible);
+          scrollOffset = Math.min(scrollOffset, maxOffset);
+          const visible = conversation.slice(scrollOffset, scrollOffset + maxVisible);
+          const content: string[] = [
+            _theme.fg("accent", "Duo history · Austin ↔ Tony"),
+            _theme.fg(
+              "dim",
+              `Austin → Tony ${austinPeerMessages}   Tony → Austin ${tonyPeerMessages}`,
+            ),
+            _theme.fg(
+              "dim",
+              `↑/↓ 滚动 · ${maxOffset ? `${scrollOffset + 1}-${Math.min(scrollOffset + maxVisible, conversation.length)}/${conversation.length}` : "全部消息"}`,
+            ),
+            "",
+            ...visible,
+            _theme.fg("dim", "ESC 返回 Duo"),
+          ];
+          const border = _theme.fg("border", `┌${"─".repeat(inner)}┐`);
+          const bottom = _theme.fg("border", `└${"─".repeat(inner)}┘`);
+          const framed = [border];
+          for (const line of content) {
+            const plainLine = line.replace(/\x1b\[[0-9;]*m/g, "");
+            const plainLength = displayWidth(plainLine);
+            // Defensive clipping also protects the frame from unexpected
+            // wide glyphs or terminal escape sequences in future messages.
+            const safeLine = plainLength > inner
+              ? plainLine.slice(0, inner)
+              : line;
+            framed.push(
+              _theme.fg("border", "│") +
+                safeLine +
+                " ".repeat(Math.max(0, inner - Math.min(inner, plainLength))) +
+                _theme.fg("border", "│"),
+            );
+          }
+          framed.push(bottom);
+          return framed;
+        },
+        invalidate() {
+          // Static history content needs no cache invalidation.
+        },
+        handleInput(data: string) {
+          if (data === "\u001b" || data === "\u001b\u001b") {
+            done();
+            return true;
+          }
+          if (data === "\u001b[A" || data === "k") {
+            scrollOffset = Math.max(0, scrollOffset - 1);
+            tui.requestRender();
+            return true;
+          }
+          if (data === "\u001b[B" || data === "j") {
+            scrollOffset += 1;
+            tui.requestRender();
+            return true;
+          }
+          return true;
+        },
+      };
+    }, {
+      overlay: true,
+      overlayOptions: {
+        anchor: "center",
+        width: "96%",
+      maxHeight: "90%",
+      },
+    });
+  };
 
   const isCurrentGeneration = (generation: number) =>
     extensionActive && generation === lifecycleGeneration;
@@ -257,32 +520,36 @@ export default function piDuo(pi: ExtensionAPI) {
     content: string,
     importance: "normal" | "important" | "decision" = "important",
     triggerTurn = false,
+    bypassGuard = false,
   ) => {
     const generation = lifecycleGeneration;
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
     if (!store || !config) return "Duo is not initialized";
-    const blocked = await guard.check(
-      store,
-      "tony",
-      content,
-      config,
-      importance,
-    );
+    const messageUserTurn = activeTonyUserTurn ?? guard.turn;
+    const currentState = await store.readState();
+    if (
+      currentState?.status === "active" &&
+      !reviewBelongsToTurn(messageUserTurn, currentState.userTurn)
+    )
+      return `Stale Tony message for user turn ${messageUserTurn} was discarded; current user turn is ${currentState.userTurn}. End this turn now.`;
+    const blocked = bypassGuard
+      ? undefined
+      : await guard.check(store, "tony", content, config, importance);
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
     const deferred = blocked?.persistWithoutTurn === true;
     if (blocked && !deferred) return blocked.reason;
     if (deferred) guard.recordDeferredMessage();
     else guard.recordPeerMessage();
     tonySentSequence++;
-    lastTonyDelivery = { sequence: tonySentSequence, content };
     const message = await store.appendMessage({
       from: "tony",
       to: "austin",
       content,
       importance,
       deferred: deferred || undefined,
-      userTurn: guard.turn,
+      userTurn: messageUserTurn,
     });
+    tonyPeerMessages++;
     if (!isCurrentGeneration(generation)) return "Duo extension is reloading.";
     let delivery: Parameters<ExtensionAPI["sendMessage"]>[1] = {
       triggerTurn: false,
@@ -332,7 +599,7 @@ export default function piDuo(pi: ExtensionAPI) {
       deferred: deferred || undefined,
       userTurn: guard.turn,
     });
-    const sentBefore = tonySentSequence;
+    austinPeerMessages++;
     const activeTony = tony;
     const wasStreaming = activeTony.isStreaming;
     let delivery: Parameters<AgentSession["sendCustomMessage"]>[1] = {
@@ -342,48 +609,103 @@ export default function piDuo(pi: ExtensionAPI) {
       if (wasStreaming) delivery = { triggerTurn: true, deliverAs: "steer" };
       else delivery = triggeringDelivery(false);
     }
-    await activeTony.sendCustomMessage(
-      {
-        customType: "pi-duo-peer",
-        content: `[Austin]${deferred ? " [saved without triggering a turn]" : ""}\n${content}`,
-        display: false,
-        details: message,
-      },
-      delivery,
-    );
-    if (!isCurrentGeneration(generation) || tony !== activeTony)
-      return "Duo extension is reloading.";
     if (deferred) {
-      return `High-priority message saved in Tony's persistent context and audit log without triggering another turn. ${blocked?.reason}`;
-    }
-    if (wasStreaming) {
-      return "Message delivered into Tony's active turn. Tony is still working; no new reply is available yet. Do not treat earlier Tony text as a response to this message.";
-    }
-    const outcome = latestAssistantOutcome(activeTony);
-    if (outcome?.error) {
-      sendMessageSafely(
+      await activeTony.sendCustomMessage(
         {
           customType: "pi-duo-peer",
-          content: `[Tony error]\n${outcome.error}`,
-          display: true,
+          content: `[Austin] [saved without triggering a turn]\n${content}`,
+          display: false,
+          details: message,
         },
-        { triggerTurn: false },
-        generation,
+        delivery,
       );
-      return `Tony failed to respond: ${outcome.error}`;
+      return `High-priority message saved in Tony's persistent context and audit log without triggering another turn. ${blocked?.reason}`;
     }
-    if (
-      tonySentSequence > sentBefore &&
-      lastTonyDelivery?.sequence === tonySentSequence
-    ) {
-      return `Tony replied:\n${lastTonyDelivery.content}`;
-    }
-    const final = outcome?.text.slice(0, 4000) ?? "";
-    if (final) {
-      await sendToAustin(final, "important", false);
-      return `Tony replied:\n${final}`;
-    }
-    return "Tony completed the turn without returning any text.";
+    setReviewIndicator("working", "正在检查 Austin 的更新");
+    tonyMustYield = false;
+    const sentBefore = tonySentSequence;
+    dispatchControlPlaneTask(
+      async () => {
+        const ownsTurnContext = activeTonyUserTurn === undefined;
+        if (ownsTurnContext) activeTonyUserTurn = message.userTurn;
+        try {
+          await activeTony.sendCustomMessage(
+            {
+              customType: "pi-duo-peer",
+              content: `[Austin]\n${content}`,
+              display: false,
+              details: message,
+            },
+            delivery,
+          );
+          if (!isCurrentGeneration(generation) || tony !== activeTony) return;
+          if (!shouldInspectPeerOutcome(wasStreaming)) return;
+          const outcome = latestAssistantOutcome(activeTony);
+          if (outcome?.error) {
+            const pending = await store?.readState();
+            if (
+              pending?.review?.status === "pending" &&
+              reviewBelongsToTurn(message.userTurn, pending.review.userTurn)
+            )
+              await markReviewFailed(message.userTurn, outcome.error);
+            sendMessageSafely(
+              {
+                customType: "pi-duo-peer",
+                content: `[Tony error]\n${outcome.error}`,
+                display: true,
+              },
+              { triggerTurn: true },
+              generation,
+            );
+            return;
+          }
+          if (tonySentSequence === sentBefore) {
+            const final = outcome?.text.slice(0, 4000) ?? "";
+            if (final) {
+              await sendToAustin(final, "important", true);
+            } else {
+              const pending = await store?.readState();
+              if (
+                pending?.review?.status === "pending" &&
+                reviewBelongsToTurn(message.userTurn, pending.review.userTurn)
+              ) {
+                await markReviewFailed(
+                  message.userTurn,
+                  "Tony completed a requested review turn with an empty response",
+                );
+                sendMessageSafely(
+                  {
+                    customType: "pi-duo-peer",
+                    content:
+                      "[Tony review unavailable]\nTony's requested review turn ended with an empty model response. Austin must not claim peer verification; disclose the failed review and rely on independent checks.",
+                    display: true,
+                  },
+                  { triggerTurn: true, deliverAs: "steer" },
+                  generation,
+                );
+              }
+            }
+          }
+        } finally {
+          if (ownsTurnContext && activeTonyUserTurn === message.userTurn)
+            activeTonyUserTurn = undefined;
+        }
+      },
+      (error) => {
+        sendMessageSafely(
+          {
+            customType: "pi-duo-peer",
+            content: `[Tony delivery error]\n${error instanceof Error ? error.message : String(error)}`,
+            display: true,
+          },
+          { triggerTurn: true },
+          generation,
+        );
+      },
+    );
+    return wasStreaming
+      ? "Message delivered into Tony's active turn. Delivery is non-blocking; Tony will wake Austin with the result."
+      : "Message delivered to Tony. Delivery is non-blocking; Tony will wake Austin with the result.";
   };
 
   const notifyPeerOfWorkspaceHandoff = async (
@@ -415,6 +737,8 @@ export default function piDuo(pi: ExtensionAPI) {
         importance: "important",
         userTurn: guard.turn,
       });
+      if (actor === "austin") austinPeerMessages++;
+      else tonyPeerMessages++;
     } catch {
       // A lock handoff must still wake the peer if the audit append fails.
     }
@@ -433,6 +757,7 @@ export default function piDuo(pi: ExtensionAPI) {
     }
     const activeTony = tony;
     if (!activeTony) return false;
+    tonyMustYield = false;
     const wasStreaming = activeTony.isStreaming;
     dispatchControlPlaneTask(
       async () => {
@@ -485,6 +810,83 @@ export default function piDuo(pi: ExtensionAPI) {
       description: `Send a concise, materially useful message to ${agentName(otherAgent(actor))}. This enters the peer's real persistent context.`,
       parameters: SendSchema,
       execute: async (_id, params) => {
+        if (actor === "tony") {
+          tonyMustYield = true;
+          if (params.reviewComplete && params.reviewFinding)
+            return result(
+              "Choose exactly one review state: reviewFinding for requested changes, or reviewComplete for final sign-off. End this turn now.",
+            );
+        }
+        if (actor === "tony" && params.reviewFinding) {
+          if (!store) return result("Duo has not been started");
+          const current = await store.readState();
+          if (
+            current?.review?.status !== "pending" ||
+            !reviewBelongsToTurn(
+              activeTonyUserTurn,
+              current.review.userTurn,
+            )
+          )
+            return result(
+              "This Tony turn does not own the current pending review. Its report is stale and was not delivered; end this turn without retrying.",
+              current,
+            );
+          const response = await sendToAustin(
+            params.message,
+            "decision",
+            true,
+            true,
+          );
+          setReviewIndicator("waiting", "Tony 已提出修改要求");
+          return result(
+            `${response} Review remains pending for Austin's fixes and Tony's final verification. End this turn now.`,
+          );
+        }
+        if (actor === "tony" && params.reviewComplete) {
+          if (!store) return result("Duo has not been started");
+          const current = await store.readState();
+          if (
+            !current?.review ||
+            !reviewBelongsToTurn(
+              activeTonyUserTurn,
+              current.review.userTurn,
+            ) ||
+            !canCompleteReview(
+              actor,
+              params.reviewComplete,
+              current.review.status,
+            )
+          )
+            return result(
+              "No pending Tony review exists. Send ordinary coordination with reviewComplete omitted.",
+              current,
+            );
+          const response = await sendToAustin(
+            params.message,
+            "decision",
+            false,
+            true,
+          );
+          if (!response.startsWith("Message delivered")) return result(response);
+          const reported = await markReviewReported(current.review.userTurn);
+          if (!reported)
+            return result(
+              "Review report was saved, but a newer user turn replaced this review before it could be marked complete.",
+            );
+          sendMessageSafely(
+            {
+              customType: "pi-duo-peer",
+              content:
+                "[Tony review complete]\nTony submitted the explicit independent review report. Austin may now reconcile todos and provide the final reviewed result.",
+              display: true,
+            },
+            { triggerTurn: true, deliverAs: "steer" },
+          );
+          setReviewIndicator("complete");
+          return result(
+            "Final review report recorded and Austin was notified. End this turn now.",
+          );
+        }
         const response =
           actor === "austin"
             ? await sendToTony(params.message, params.importance ?? "normal")
@@ -493,7 +895,11 @@ export default function piDuo(pi: ExtensionAPI) {
                 params.importance ?? "normal",
                 true,
               );
-        return result(response);
+        return result(
+          actor === "tony"
+            ? `${response} End this turn now; wait for Austin's next message.`
+            : response,
+        );
       },
     });
     api.registerTool({
@@ -521,8 +927,11 @@ export default function piDuo(pi: ExtensionAPI) {
       parameters: GoalSchema,
       execute: async (_id, params) => {
         if (!store) return result("Duo has not been started");
+        const current = await store.readState();
         if (params.action === "get")
-          return result((await store.readState())?.goal || "(not set)");
+          return result(current?.goal || "(not set)");
+        if (!canMutateDuoState(current?.status))
+          return result("Duo is stopped; use /duo resume before changing shared state.", current);
         const goal = params.goal?.trim();
         if (!goal) return result("goal is required for set");
         const state = await store.update((draft) => {
@@ -556,6 +965,9 @@ export default function piDuo(pi: ExtensionAPI) {
             state,
           );
         }
+        const current = await store.readState();
+        if (!canMutateDuoState(current?.status))
+          return result("Duo is stopped; use /duo resume before changing shared state.", current);
         let message = "";
         const state = await store.update((draft) => {
           if (params.action === "add") {
@@ -614,6 +1026,9 @@ export default function piDuo(pi: ExtensionAPI) {
             state,
           );
         }
+        const current = await store.readState();
+        if (!canMutateDuoState(current?.status))
+          return result("Duo is stopped; use /duo resume before changing shared state.", current);
         const decisionText = params.text?.trim();
         if (!decisionText) return result("text is required for add");
         const state = await store.update((draft) => {
@@ -646,6 +1061,8 @@ export default function piDuo(pi: ExtensionAPI) {
               : `Workspace write owner: ${currentState?.workspaceOwner ?? "none"}`,
             currentState,
           );
+        if (!canMutateDuoState(currentState?.status))
+          return result("Duo is stopped; use /duo resume before changing shared state.", currentState);
         if (
           !canUseWorkspaceAction(
             latestConfig.writePolicy,
@@ -705,6 +1122,13 @@ export default function piDuo(pi: ExtensionAPI) {
 
   const installWriteGuard = (api: ExtensionAPI, actor: AgentId) => {
     api.on("tool_call", async (event) => {
+      if (actor === "tony" && tonyMustYield) {
+        return {
+          block: true,
+          reason:
+            "Tony already sent this turn's consolidated peer message. End the turn now; further tools and polling are blocked until Austin sends new work.",
+        };
+      }
       const shellCommand =
         event.toolName === "bash"
           ? String((event.input as { command?: unknown }).command ?? "")
@@ -716,6 +1140,16 @@ export default function piDuo(pi: ExtensionAPI) {
             "Tony must not sleep or poll for Austin. Send current work with duo_send and end the turn; a peer message will start another turn.",
         };
       }
+      const toolPath =
+        event.toolName === "edit" || event.toolName === "write"
+          ? String((event.input as { path?: unknown }).path ?? "")
+          : "";
+      if (
+        actor === "tony" &&
+        (event.toolName === "edit" || event.toolName === "write") &&
+        store?.isTonyScratchPath(toolPath)
+      )
+        return;
       const mutating =
         event.toolName === "edit" ||
         event.toolName === "write" ||
@@ -734,7 +1168,7 @@ export default function piDuo(pi: ExtensionAPI) {
           return {
             block: true,
             reason:
-              "Austin-only write policy: Tony may inspect, test, and review, but only Austin may modify project files. Send concise file:line findings or acceptance tests with duo_send.",
+              `Austin-only write policy: Tony may inspect, test, and review, but only Austin may modify project files. Disposable harnesses may be written with write/edit under ${store.tonyScratchDir}. Send concise file:line findings or acceptance tests with duo_send.`,
           };
         }
         const owner = state?.workspaceOwner
@@ -803,6 +1237,7 @@ export default function piDuo(pi: ExtensionAPI) {
       ],
     });
     await loader.reload();
+    await currentStore.ensureTonyScratch();
     if (!isCurrentGeneration(generation)) return;
     const manager = state.agents.tony.sessionFile
       ? SessionManager.open(state.agents.tony.sessionFile)
@@ -852,48 +1287,128 @@ export default function piDuo(pi: ExtensionAPI) {
     }
   };
 
-  const queueTonyTask = (prompt: string) => {
+  const markReviewFailed = async (userTurn: number, error: string) => {
+    if (!store) return;
+    const current = await store.readState();
+    if (current?.review?.status !== "pending" || current.review.userTurn !== userTurn)
+      return;
+    try {
+      await store.update((draft) => {
+        if (
+          draft.review?.status === "pending" &&
+          draft.review.userTurn === userTurn
+        ) {
+          draft.review.status = "failed";
+          draft.review.error = error;
+          draft.review.updatedAt = new Date().toISOString();
+        }
+      }, current.revision);
+      setReviewIndicator("failed", error);
+    } catch {
+      // A newer user turn may have replaced this review; leave that state intact.
+    }
+  };
+
+  const markReviewReported = async (userTurn: number): Promise<boolean> => {
+    if (!store) return false;
+    const current = await store.readState();
+    if (current?.review?.status !== "pending" || current.review.userTurn !== userTurn)
+      return false;
+    try {
+      await store.update((draft) => {
+        if (
+          draft.review?.status === "pending" &&
+          draft.review.userTurn === userTurn
+        ) {
+          draft.review.status = "reported";
+          draft.review.updatedAt = new Date().toISOString();
+          delete draft.review.error;
+        }
+      }, current.revision);
+      setReviewIndicator("complete");
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const queueTonyTask = (prompt: string, userTurn: number) => {
     const generation = lifecycleGeneration;
     tonyQueue = tonyQueue
       .then(async () => {
         if (!isCurrentGeneration(generation) || !tony) return;
         const activeTony = tony;
-        const sentBefore = tonySentSequence;
-        await activeTony.sendCustomMessage(
-          {
-            customType: "pi-duo-user-task",
-            content: `[Shared user task for ${roleDescription("tony")}]\nAustin is the foreground agent and owns project-file edits in austin-only mode. Independently inspect, test, and review; send concise evidence instead of implementing files.\n\n${prompt}`,
-            display: false,
-          },
-          triggeringDelivery(activeTony.isStreaming),
-        );
+        setReviewIndicator("working", "等待 Tony 空闲后开始");
+        // A followUp sent while Tony is streaming is only queued; its promise
+        // resolves before that future turn finishes. Wait for the current turn
+        // to become idle, then start this review as its own attributable turn.
+        await activeTony.waitForIdle();
         if (!isCurrentGeneration(generation) || tony !== activeTony) return;
-        const outcome = latestAssistantOutcome(activeTony);
-        if (outcome?.error) {
-          sendMessageSafely(
+        tonyMustYield = false;
+        activeTonyUserTurn = userTurn;
+        setReviewIndicator("working");
+        const sentBefore = tonySentSequence;
+        try {
+          await activeTony.sendCustomMessage(
             {
-              customType: "pi-duo-peer",
-              content: `[Tony error]\n${outcome.error}`,
-              display: true,
+              customType: "pi-duo-user-task",
+              content: `[Shared user task for ${roleDescription("tony")}]\nAustin is the foreground agent and owns project-file edits in austin-only mode. Independently inspect, test, and review; send concise evidence instead of implementing files. Preliminary coordination uses duo_send normally, then you must end the turn. Use reviewFinding=true for one consolidated actionable report that requests changes; keep the review pending until Austin responds. Only the consolidated, independently verified final report may use reviewComplete=true.\n\n${prompt}`,
+              display: false,
             },
-            { triggerTurn: false },
-            generation,
+            triggeringDelivery(false),
           );
-          return;
-        }
-        if (tonySentSequence === sentBefore) {
-          const final = outcome?.text.slice(0, 4000) ?? "";
-          if (final) await sendToAustin(final, "important", false);
+          if (!isCurrentGeneration(generation) || tony !== activeTony) return;
+          const outcome = latestAssistantOutcome(activeTony);
+          if (outcome?.error) {
+            await markReviewFailed(userTurn, outcome.error);
+            sendMessageSafely(
+              {
+                customType: "pi-duo-peer",
+                content: `[Tony error]\n${outcome.error}`,
+                display: true,
+              },
+              { triggerTurn: true },
+              generation,
+            );
+            return;
+          }
+          if (tonySentSequence === sentBefore) {
+            const final = outcome?.text.slice(0, 4000) ?? "";
+            if (final) {
+              await sendToAustin(final, "important", true, true);
+            }
+            else {
+              await markReviewFailed(
+                userTurn,
+                "Tony completed without a review report",
+              );
+              sendMessageSafely(
+                {
+                  customType: "pi-duo-peer",
+                  content:
+                    "[Tony review unavailable]\nTony completed without a review report. Austin should finish with independent verification and disclose that peer review was unavailable.",
+                  display: true,
+                },
+                { triggerTurn: true },
+                generation,
+              );
+            }
+          }
+        } finally {
+          if (activeTonyUserTurn === userTurn) activeTonyUserTurn = undefined;
         }
       })
-      .catch((error) => {
+      .catch(async (error) => {
+        if (activeTonyUserTurn === userTurn) activeTonyUserTurn = undefined;
+        const errorText = error instanceof Error ? error.message : String(error);
+        await markReviewFailed(userTurn, errorText);
         sendMessageSafely(
           {
             customType: "pi-duo-peer",
-            content: `[Tony error]\n${error instanceof Error ? error.message : String(error)}`,
+            content: `[Tony error]\n${errorText}`,
             display: true,
           },
-          undefined,
+          { triggerTurn: true },
           generation,
         );
       });
@@ -909,12 +1424,30 @@ export default function piDuo(pi: ExtensionAPI) {
   );
 
   pi.on("session_start", async (_event, ctx) => {
+    foregroundUI = ctx.ui;
     store = getStore(ctx.cwd);
     config = await store.readConfig();
-    const state = await enforceWritePolicy(store, config);
-    if (
+    let state = await enforceWritePolicy(store, config);
+    austinPeerMessages = state?.austinPeerMessageCount ?? 0;
+    tonyPeerMessages = state?.tonyPeerMessageCount ?? 0;
+    const isAustinSession =
       state?.status === "active" &&
-      state.agents.austin.sessionId === ctx.sessionManager.getSessionId()
+      state.agents.austin.sessionId === ctx.sessionManager.getSessionId();
+    foregroundDuoActive = isAustinSession;
+    let interruptedReview = false;
+    if (isAustinSession && state?.review?.status === "pending") {
+      state = await store.update((draft) => {
+        if (draft.review?.status === "pending") {
+          draft.review.status = "failed";
+          draft.review.error =
+            "Tony review was interrupted by a session restart or extension reload";
+          draft.review.updatedAt = new Date().toISOString();
+          interruptedReview = true;
+        }
+      });
+    }
+    if (
+      isAustinSession
     ) {
       try {
         await ensureTony(ctx.cwd, ctx.modelRegistry);
@@ -925,10 +1458,39 @@ export default function piDuo(pi: ExtensionAPI) {
         );
       }
     }
+    if (interruptedReview) {
+      ctx.ui.notify(
+        "pi-duo: the pending Tony review was interrupted; Austin will resume with independent verification",
+        "warning",
+      );
+      sendMessageSafely(
+        {
+          customType: "pi-duo-peer",
+          content:
+            "[Tony review interrupted]\nThe pending background review was interrupted by a session restart or extension reload. Re-check the current workspace, reconcile shared todos, and clearly disclose any verification that remains unavailable.",
+          display: true,
+        },
+        { triggerTurn: true },
+      );
+      setReviewIndicator(
+        "failed",
+        "reload/session restart 中断了后台审查",
+      );
+    } else if (!isAustinSession) {
+      setReviewIndicator("clear");
+    } else if (state?.review?.status === "pending") {
+      setReviewIndicator("working");
+    } else if (state?.review?.status === "reported") {
+      setReviewIndicator("complete");
+    } else if (state?.review?.status === "failed") {
+      setReviewIndicator("failed", state.review.error);
+    } else {
+      setReviewIndicator("clear");
+    }
   });
 
   pi.on("before_agent_start", async (event) => {
-    if (!store) return;
+    if (!store || !foregroundDuoActive) return;
     const latestConfig = await store.readConfig();
     const state = await enforceWritePolicy(store, latestConfig);
     if (!state || state.status !== "active") return;
@@ -937,17 +1499,76 @@ export default function piDuo(pi: ExtensionAPI) {
     };
   });
 
+  pi.on("message_end", async (event) => {
+    if (!store || !foregroundDuoActive || event.message.role !== "assistant") return;
+    if (
+      event.message.stopReason !== "stop" &&
+      event.message.stopReason !== "length"
+    )
+      return;
+    const state = await store.readState();
+    if (!state || state.status !== "active") return;
+    const notice = completionGateNotice(state);
+    if (!notice) return;
+    return {
+      message: {
+        ...event.message,
+        content: [
+          { type: "text" as const, text: `[${notice}]\n\n` },
+          ...event.message.content,
+        ],
+      },
+    };
+  });
+
+  pi.on("agent_end", async () => {
+    if (!store || !foregroundDuoActive) return;
+    const state = await store.readState();
+    if (
+      !state ||
+      state.status !== "active" ||
+      state.review?.status === "pending" ||
+      completionReconcileTurn === guard.turn
+    )
+      return;
+    const ids = openCompletionTodoIds(state);
+    if (!ids.length) return;
+    completionReconcileTurn = guard.turn;
+    sendMessageSafely(
+      {
+        customType: "pi-duo-completion-gate",
+        content: `Before giving the final reviewed answer, reconcile shared todo ${ids.map((id) => `#${id}`).join(", ")}. Mark completed work done; leave genuinely unfinished work pending or blocked and disclose it.`,
+        display: true,
+      },
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
+  });
+
   pi.on("input", async (event, ctx) => {
     if (event.source === "extension" || event.text.trimStart().startsWith("/"))
       return;
-    guard.beginUserTurn();
     const currentStore = getStore(ctx.cwd);
     config = await currentStore.readConfig();
     const state = await enforceWritePolicy(currentStore, config);
-    if (state?.status === "active" && config.autoDispatch) {
+    const userTurn = guard.beginUserTurn(
+      foregroundDuoActive && state?.status === "active"
+        ? await currentStore.advanceUserTurn()
+        : undefined,
+    );
+    if (foregroundDuoActive && state?.status === "active" && config.autoDispatch) {
       try {
         await ensureTony(ctx.cwd, ctx.modelRegistry);
-        queueMicrotask(() => queueTonyTask(event.text));
+        const timestamp = new Date().toISOString();
+        await currentStore.update((draft) => {
+          draft.review = {
+            userTurn,
+            status: "pending",
+            startedAt: timestamp,
+            updatedAt: timestamp,
+          };
+        });
+        setReviewIndicator("working");
+        queueMicrotask(() => queueTonyTask(event.text, userTurn));
       } catch (error) {
         ctx.ui.notify(
           `pi-duo could not dispatch Tony: ${error instanceof Error ? error.message : String(error)}`,
@@ -958,7 +1579,7 @@ export default function piDuo(pi: ExtensionAPI) {
   });
 
   pi.on("model_select", async (event) => {
-    if (!store || !(await store.readState())) return;
+    if (!store || !foregroundDuoActive || !(await store.readState())) return;
     const selected = {
       provider: event.model.provider,
       modelId: event.model.id,
@@ -974,6 +1595,9 @@ export default function piDuo(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    setReviewIndicator("clear");
+    foregroundUI = undefined;
+    foregroundDuoActive = false;
     extensionActive = false;
     lifecycleGeneration++;
     await disposeTony();
@@ -989,6 +1613,12 @@ export default function piDuo(pi: ExtensionAPI) {
       config = await currentStore.readConfig();
 
       if (command === "start") {
+        const existing = await currentStore.readState();
+        if (blocksDuoRestart(existing))
+          return void ctx.ui.notify(
+            "Cannot replace an active Duo while Tony review is pending. Use /duo stop first to explicitly record the interrupted review, then run /duo start.",
+            "error",
+          );
         const peerArg = parseFlag(args, "peer");
         const goalArg = parseFlag(args, "goal");
         const currentModel = ctx.model;
@@ -998,15 +1628,6 @@ export default function piDuo(pi: ExtensionAPI) {
           provider: currentModel.provider,
           modelId: currentModel.id,
         };
-        if (
-          config.agentA &&
-          modelText(config.agentA) !== modelText(austinRef)
-        ) {
-          return void ctx.ui.notify(
-            `Austin is configured as ${modelText(config.agentA)}. Select that Pi model first, or update agentA in .pi-duo/config.json.`,
-            "error",
-          );
-        }
         let peerRef = peerArg ? parseModelRef(peerArg) : config.agentB;
         if (!peerRef && ctx.hasUI) {
           const choices = ctx.modelRegistry
@@ -1035,12 +1656,16 @@ export default function piDuo(pi: ExtensionAPI) {
           draft.agents.austin.sessionFile = ctx.sessionManager.getSessionFile();
           if (goalArg) draft.goal = goalArg;
         });
+        austinPeerMessages = 0;
+        tonyPeerMessages = 0;
+        foregroundDuoActive = true;
         await ensureTony(ctx.cwd, ctx.modelRegistry);
         state = (await currentStore.readState()) ?? state;
         ctx.ui.notify(
           `Duo started: Austin (${modelText(austinRef)}) ↔ Tony (${modelText(peerRef)})`,
           "info",
         );
+        setReviewIndicator("clear");
         pi.sendMessage({
           customType: "pi-duo-peer",
           content: renderStatus(state, config, "austin"),
@@ -1053,18 +1678,86 @@ export default function piDuo(pi: ExtensionAPI) {
       if (!state)
         return void ctx.ui.notify("No Duo session. Use /duo start.", "warning");
 
+      if (command === "history") {
+        await showHistory(ctx);
+        return;
+      }
+
       if (command === "stop") {
-        await disposeTony();
+        const rawTarget = args.split(/\s+/)[1];
+        const target = parseAgentTarget(rawTarget);
+        if (rawTarget && !target)
+          return void ctx.ui.notify(
+            "Usage: /duo stop [austin|tony] (agent names are case-insensitive)",
+            "error",
+          );
+        if (target === "austin") {
+          if (!ctx.isIdle()) {
+            ctx.abort();
+            ctx.ui.notify(
+              "Austin's active turn was aborted; Tony and the Duo session remain active",
+              "info",
+            );
+          } else {
+            ctx.ui.notify(
+              "Austin is already idle; Tony and the Duo session remain active",
+              "info",
+            );
+          }
+          return;
+        }
+        if (target === "tony") {
+          await currentStore.update((draft) => {
+            if (draft.review?.status === "pending") {
+              draft.review.status = "failed";
+              draft.review.error =
+                "Tony review was interrupted by /duo stop tony";
+              draft.review.updatedAt = new Date().toISOString();
+            }
+          });
+          setReviewIndicator("failed", "Tony 已被用户定向停止");
+          ctx.ui.notify(
+            "Tony is being stopped; Austin and the Duo session remain active. Use /duo resume to start Tony again.",
+            "info",
+          );
+          dispatchControlPlaneTask(disposeTony, (error) => {
+            ctx.ui.notify(
+              `Tony stop cleanup reported: ${error instanceof Error ? error.message : String(error)}`,
+              "warning",
+            );
+          });
+          return;
+        }
         await currentStore.update((draft) => {
           draft.status = "stopped";
+          if (draft.review?.status === "pending") {
+            draft.review.status = "failed";
+            draft.review.error = "Tony review was interrupted by /duo stop";
+            draft.review.updatedAt = new Date().toISOString();
+          }
         });
+        foregroundDuoActive = false;
+        setReviewIndicator("clear");
+        if (!ctx.isIdle()) ctx.abort();
         ctx.ui.notify(
-          "Duo stopped; both session histories were preserved",
+          "Duo stopped immediately; active Austin/Tony turns are being aborted and both session histories were preserved",
           "info",
         );
+        dispatchControlPlaneTask(disposeTony, (error) => {
+          ctx.ui.notify(
+            `Duo stopped, but Tony cleanup reported: ${error instanceof Error ? error.message : String(error)}`,
+            "warning",
+          );
+        });
       } else if (command === "resume") {
         await currentStore.update((draft) => {
           draft.status = "active";
+          if (draft.review?.status === "pending") {
+            draft.review.status = "failed";
+            draft.review.error =
+              "Tony review was interrupted before /duo resume; run a new task for a fresh review";
+            draft.review.updatedAt = new Date().toISOString();
+          }
         });
         const austinFile = state.agents.austin.sessionFile;
         if (
@@ -1080,6 +1773,7 @@ export default function piDuo(pi: ExtensionAPI) {
           return;
         }
         await ensureTony(ctx.cwd, ctx.modelRegistry);
+        foregroundDuoActive = true;
         ctx.ui.notify("Duo resumed", "info");
       } else if (command === "goal") {
         const goal = args.slice("goal".length).trim();
@@ -1102,8 +1796,18 @@ export default function piDuo(pi: ExtensionAPI) {
           .filter(Boolean);
         for (const update of updates) {
           const [key, value] = update.split("=");
-          if (key === "maxPeerMessagesPerTurn")
-            config.maxPeerMessagesPerTurn = Number(value);
+          if (key === "maxPeerMessagesPerTurn") {
+            const parsed = Number(value);
+            if (
+              !Number.isSafeInteger(parsed) ||
+              parsed < MIN_PEER_MESSAGES_PER_TURN
+            )
+              return void ctx.ui.notify(
+                `maxPeerMessagesPerTurn must be an integer >= ${MIN_PEER_MESSAGES_PER_TURN} so a review/fix/re-review cycle cannot deadlock`,
+                "error",
+              );
+            config.maxPeerMessagesPerTurn = parsed;
+          }
           else if (key === "maxDeferredMessagesPerTurn")
             config.maxDeferredMessagesPerTurn = Number(value);
           else if (key === "maxConsecutivePeerTurns")
@@ -1122,6 +1826,7 @@ export default function piDuo(pi: ExtensionAPI) {
           } else return void ctx.ui.notify(`Unknown config key: ${key}`, "error");
         }
         await currentStore.writeConfig(config);
+        config = await currentStore.readConfig();
         await enforceWritePolicy(currentStore, config);
         pi.sendMessage({
           customType: "pi-duo-peer",
@@ -1136,7 +1841,7 @@ export default function piDuo(pi: ExtensionAPI) {
         });
       } else {
         ctx.ui.notify(
-          "Usage: /duo [start|stop|resume|status|goal|config]",
+          "Usage: /duo [start|stop|resume|history|status|goal|config]",
           "warning",
         );
       }
