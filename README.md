@@ -220,11 +220,23 @@ Workspace write owner: Austin
 /duo
 /duo status
 /duo history
+/duo workbench
+/duo view
 ```
 
 显示运行状态、当前角色、共享目标、todo 进度、两个模型/session、写入策略、workspace owner、消息总数，以及 Austin → Tony、Tony → Austin 各自通过控制面发送的消息次数和最后活动时间。这里的次数只统计双方实际发给对方的 Duo 消息，不统计模型内部思考或工具调用。
 
-`/duo history` 打开当前 Duo 回合的聊天式消息历史：Austin 发出的内容靠左，Tony 发出的内容靠右。按 `ESC` 关闭历史视图并返回 Pi。
+`/duo history` 打开当前 Duo 回合的聊天式消息历史：Austin 发出的内容靠左，Tony 发出的内容靠右。按 `ESC` 关闭历史视图并返回 Pi。历史视图与工作现场是**互斥的单个 overlay**（Pi 的 `hideOverlay()` 只能弹出最上层），因此打开历史会先隐藏工作现场，ESC 关闭历史后会自动恢复工作现场。
+
+`/duo workbench` 打开双栏实时"工作现场"视图，`/duo view` 则在显示与隐藏之间切换（toggle）。该视图在**进入 Duo 模式时自动打开**：`/duo start` 成功、以及重新载入已有 active session 时都会自动显示，无需再手动执行命令。
+
+视图形态：**上半屏为双栏原生 transcript**（左栏 Austin、右栏 Tony）。两栏直接复用 Pi 的 assistant、user 与 tool 组件，历史恢复、流式 thinking、工具执行中的状态与工具结果都按普通 Pi 会话显示；`duo_send` 只是 session 中的一条普通消息。**下半屏保持 Austin 的 Pi 输入框、status 与 footer**，输入只发送给 Austin。
+
+关键性质与限制：
+
+- **不抢键盘焦点（non-capturing）**：面板常驻显示时输入框仍然可用，你可以一边看双栏一边直接输入下一个任务。
+- **各栏独立滚动**：Austin 与 Tony 各有一个原生 `ScrollView`，持续跟随各自 session 的最新输出。
+- **无法做到"真·分屏"**：Pi 的弹性上半区只属于其内部的 transcript 滚动区，扩展 API 无法替换它。因此本视图是覆盖在上半屏的非捕获面板，视觉上等同分屏，但机制上不是把 chat 区域替换掉；`/duo view` 可随时隐藏。
 
 ### 创建新的 Duo
 

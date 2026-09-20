@@ -3,10 +3,15 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import piDuo from "../index.js";
-import { isBlockedByFirstSyncBarrier } from "../src/coordinator.js";
+import {
+  isBlockedByFirstSyncBarrier,
+  workspaceMutationBlockReason,
+} from "../src/coordinator.js";
 import { DuoStore } from "../src/store.js";
+
+initTheme(undefined, false);
 
 test("extension registers commands, tools, renderer, and lifecycle hooks without network access", () => {
   const tools: string[] = [];
@@ -676,7 +681,6 @@ test("EXPLORE collaboration indicator does not use review wording", async () => 
       );
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.ok(statuses.some((status) => status?.includes("Tony 正在后台协作")));
     assert.ok(statuses.every((status) => !status?.includes("审查")));
   } finally {
     await rm(cwd, { recursive: true, force: true });
@@ -984,7 +988,892 @@ test("ensureTony failure initializes new turn state in explore and degrades grac
     );
     assert.ok(unavailableNotice);
     assert.deepEqual(unavailableNotice.opts, { triggerTurn: true, deliverAs: "steer" });
-    assert.ok(statuses.some((status) => status?.includes("协作不可用，已降级为单 Agent")));
+    assert.ok(statuses.every((status) => !status?.includes("协作不可用，已降级为单 Agent")));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("duo mode auto-opens a persistent non-capturing workbench overlay", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-workbench-open-"));
+  try {
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+
+    const commands = new Map<string, (args: string, ctx: any) => Promise<any>>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const overlayCalls: Array<{ options: any; component: any }> = [];
+    let renderRequests = 0;
+    let hidden = 0;
+    let customSettled = 0;
+    let handleHides = 0;
+    let onHandleCalls = 0;
+    let maxStackDepth = 0;
+
+    // Faithful model of pi-tui's REAL overlay semantics, not just pi 0.86's
+    // `ExtensionUIContext` shape:
+    //   - overlays live on a LIFO stack;
+    //   - the handle's `hide()` is ENTRY-TARGETED (splices its own entry);
+    //   - `TUI.hideOverlay()` (what `done()` calls) pops the TOPMOST entry
+    //     only and no-ops on an empty stack;
+    //   - `onHandle` fires only after the factory resolves.
+    // The committed test previously modelled none of this, so it could not
+    // detect the topmost-pop hazard it claimed to guard.
+    const stack: Array<{ handle: { hide: () => void } }> = [];
+    // Captures the `done` of the most recent non-workbench overlay (history),
+    // so a test can dismiss it the way a user pressing ESC would.
+    let dismissTopModal: (() => void) | undefined;
+
+    const ui = {
+      notify: () => {},
+      setStatus: () => {},
+      setWidget: () => {},
+      custom: (factory: any, options: any) => {
+        const tui = {
+          requestRender: () => { renderRequests++; },
+          terminal: { rows: 40, columns: 120 },
+        };
+        let closed = false;
+        let entry: { handle: { hide: () => void } } | undefined;
+        let resolveCustom: () => void = () => {};
+        const done = () => {
+          if (closed) return; // pi guards against a double close
+          closed = true;
+          if (stack.length > 0) {
+            hidden++;
+            stack.pop(); // topmost-only pop, exactly like hideOverlay()
+          }
+          customSettled++;
+          resolveCustom();
+        };
+        const component = factory(tui, {}, {}, done);
+        // pi resolves `overlayOptions` AFTER the factory runs, so a function
+        // sees the row budget the factory applied. Mirror that ordering.
+        const resolved =
+          typeof options.overlayOptions === "function"
+            ? options.overlayOptions()
+            : options.overlayOptions;
+        overlayCalls.push({ component, options: { ...options, overlayOptions: resolved } });
+        entry = {
+          handle: {
+            hide: () => {
+              const index = stack.indexOf(entry!);
+              if (index !== -1) {
+                stack.splice(index, 1);
+                handleHides++;
+              }
+            },
+          },
+        };
+        stack.push(entry);
+        maxStackDepth = Math.max(maxStackDepth, stack.length);
+        options.onHandle?.(entry.handle);
+        onHandleCalls++;
+        // The first overlay opened is the workbench (`/duo start`). Any later
+        // one is the history modal, whose `done` a test can invoke to emulate
+        // the user pressing ESC.
+        if (overlayCalls.length > 1) dismissTopModal = done;
+        return new Promise<void>((resolve) => {
+          resolveCustom = resolve;
+        });
+      },
+    };
+
+    const api = {
+      registerTool() {},
+      registerCommand(name: string, command: { handler: any }) {
+        commands.set(name, command.handler);
+      },
+      registerMessageRenderer() {},
+      sendMessage() {},
+      on(name: string, handler: any) {
+        if (!events.has(name)) events.set(name, []);
+        events.get(name)!.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+
+    piDuo(api);
+
+    const ctx = {
+      cwd,
+      mode: "tui",
+      ui,
+      isIdle: () => true,
+      abort: () => {},
+      model: { provider: "provider-a", id: "model/a" },
+      hasUI: true,
+      sessionManager: {
+        getSessionId: () => "mock-session-id",
+        getSessionFile: () => undefined,
+      },
+      modelRegistry: {
+        find: () => ({ provider: "provider-b", id: "model/b" }),
+        getAvailable: () => [],
+      },
+    };
+
+    const handler = commands.get("duo");
+    assert.ok(handler, "/duo command must be registered");
+
+    // `foregroundUI` is established by pi's own session_start hook, exactly as
+    // in production. Firing it also exercises the state-restore path.
+    for (const onSessionStart of events.get("session_start") || []) {
+      await onSessionStart({}, ctx);
+    }
+
+    // `/duo start` must leave the panel visible without any extra command.
+    // An explicit peer keeps the handler off the interactive model picker.
+    await handler("start --peer provider-b/model/b", ctx);
+    assert.equal(overlayCalls.length, 1, "starting duo mode opens the workbench");
+
+    const call = overlayCalls[0];
+    assert.equal(call.options.overlay, true, "workbench is mounted as an overlay");
+    // Non-capturing is the whole point: the editor keeps keyboard focus so the
+    // user can type the next task while watching both columns.
+    assert.equal(call.options.overlayOptions.nonCapturing, true);
+    // Top-anchored full-width geometry occupies the upper display region.
+    assert.equal(call.options.overlayOptions.anchor, "top-left");
+    assert.equal(call.options.overlayOptions.row, 0);
+    assert.equal(call.options.overlayOptions.col, 0);
+    assert.equal(call.options.overlayOptions.width, "100%");
+    // Pi's 30%-of-terminal value is an editor maximum, not its current height.
+    // The normal editor is 3 rows; reserving the maximum exposes the native
+    // Austin transcript beneath the overlay and duplicates the left column.
+    // At 40 rows: editor 3 + footer 3 + transient dock slack 2 = 8.
+    assert.equal(call.options.overlayOptions.maxHeight, 40 - 8);
+    // pi's own `showOverlay` repaints when the overlay is installed, so no
+    // eager render call is needed at open time. What matters is that streaming
+    // refreshes are wired to the REAL TUI handed to the factory.
+    assert.equal(renderRequests, 0, "no redundant eager render at open time");
+
+    // The panel is a live component, not a blocked dialog: it renders rows and
+    // never declares an input handler.
+    const rows = call.component.render(120);
+    assert.ok(Array.isArray(rows) && rows.length > 0);
+    assert.equal(call.component.handleInput, undefined);
+    assert.equal(typeof call.component.invalidate, "function");
+
+    // Pi emits these extension events before SessionManager appends them. The
+    // first turn must therefore be visible in its column without waiting for
+    // a disk round-trip, and an ended assistant must not blink out in between.
+    const austinUser = { role: "user", content: "Austin first turn" };
+    const austinAssistant = {
+      role: "assistant",
+      content: [{ type: "text", text: "Austin first reply" }],
+    };
+    for (const onStart of events.get("message_start") || []) {
+      onStart({ message: austinUser });
+    }
+    let transcript = (call.component as any).austinDocument.render(59).join("\n");
+    assert.match(transcript, /Austin first turn/);
+
+    for (const onStart of events.get("message_start") || []) {
+      onStart({ message: austinAssistant });
+    }
+    for (const onEnd of events.get("message_end") || []) {
+      onEnd({ message: austinAssistant });
+    }
+    transcript = (call.component as any).austinDocument.render(59).join("\n");
+    assert.match(transcript, /Austin first reply/);
+
+    // A streaming delta must repaint through the factory's TUI (the only
+    // repaint channel that exists on pi 0.86's UI context).
+    for (const onStart of events.get("message_start") || []) {
+      onStart({ message: { role: "assistant" } });
+    }
+    for (const onUpdate of events.get("message_update") || []) {
+      onUpdate({
+        message: { role: "assistant" },
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x" },
+      });
+    }
+    assert.ok(renderRequests > 0, "streaming repaints through the factory TUI");
+
+    // The workbench must be installed as an overlay whose handle was delivered,
+    // so the defensive teardown path is not dead code.
+    assert.equal(onHandleCalls, 1, "onHandle fires for the workbench overlay");
+
+    // ---- single-overlay ownership: /duo history must not stack ----
+    // The workbench is open now. `/duo history` closes it BEFORE opening the
+    // history overlay; if it did not, the stack would hold 2 pi-duo overlays
+    // and the topmost-only `hideOverlay()` could later tear down the wrong one.
+    const historyPromise = handler("history", ctx);
+    // A modal's custom() promise does not settle until dismissed, so assert the
+    // ordering while it is open.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(maxStackDepth, 1, "pi-duo never holds 2 overlays at once");
+    assert.equal(stack.length, 1, "history owns the stack alone");
+    assert.equal(
+      customSettled,
+      1,
+      "workbench settled before history took ownership",
+    );
+    assert.equal(hidden, 1, "history closed the workbench exactly once");
+
+    // Dismiss history (ESC) and confirm it drains to zero without resurrecting
+    // anything, then let the awaited handler finish.
+    assert.ok(dismissTopModal, "history exposes a dismiss path");
+    dismissTopModal!();
+    await historyPromise;
+    assert.equal(
+      stack.length,
+      1,
+      "workbench is restored after history closes",
+    );
+    assert.equal(
+      customSettled,
+      2,
+      "history settled exactly once when dismissed",
+    );
+
+    // `/duo view` toggles the panel off and then back on. The restored
+    // workbench is topmost, so closing it must pop exactly one entry.
+    await handler("view", ctx);
+    assert.equal(customSettled, 3, "closing the workbench settles it once");
+    // Three topmost pops so far: the pre-history workbench close, the history
+    // dismiss, and this toggle-off. Any extra pop would mean a double-remove.
+    assert.equal(hidden, 3, "each close pops exactly one overlay entry");
+
+    await handler("view", ctx);
+    assert.equal(overlayCalls.length, 4, "toggling again reopens the panel");
+
+    // `/duo stop` must not leave a stale overlay behind.
+    await handler("stop", ctx);
+    assert.equal(stack.length, 0, "stopping duo mode removes every overlay");
+    const overlaysAfterStop = overlayCalls.length;
+    await handler("view", ctx);
+    assert.equal(
+      overlayCalls.length,
+      overlaysAfterStop,
+      "a stopped Duo cannot show a misleading empty workbench",
+    );
+    assert.equal(handleHides, 0, "the happy path never double-removes");
+    assert.equal(
+      maxStackDepth,
+      1,
+      "pi-duo never held two overlays at any point in this scenario",
+    );
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("/duo history does not resurrect a workbench that was already hidden", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-hist-norestore-"));
+  try {
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+
+    const commands = new Map<string, (args: string, ctx: any) => Promise<any>>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    let overlayOpens = 0;
+    let dismissTopModal: (() => void) | undefined;
+
+    const ui = {
+      notify: () => {},
+      setStatus: () => {},
+      setWidget: () => {},
+      custom: (factory: any, options: any) => {
+        overlayOpens++;
+        const tui = {
+          requestRender: () => {},
+          terminal: { rows: 40, columns: 120 },
+        };
+        let resolveCustom: () => void = () => {};
+        const component = factory(tui, {}, {}, () => resolveCustom());
+        void component;
+        if (typeof options.overlayOptions === "function") options.overlayOptions();
+        const done = () => resolveCustom();
+        if (overlayOpens > 1) dismissTopModal = done;
+        return new Promise<void>((resolve) => {
+          resolveCustom = resolve;
+        });
+      },
+    };
+
+    const api = {
+      registerTool() {},
+      registerCommand(name: string, command: { handler: any }) {
+        commands.set(name, command.handler);
+      },
+      registerMessageRenderer() {},
+      sendMessage() {},
+      on(name: string, handler: any) {
+        if (!events.has(name)) events.set(name, []);
+        events.get(name)!.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+
+    piDuo(api);
+
+    const ctx: any = {
+      cwd,
+      mode: "tui",
+      ui,
+      isIdle: () => true,
+      abort: () => {},
+      hasUI: true,
+      model: { provider: "provider-a", id: "model/a" },
+      sessionManager: {
+        getSessionId: () => "mock-session-id",
+        getSessionFile: () => undefined,
+      },
+      modelRegistry: {
+        find: () => ({ provider: "provider-b", id: "model/b" }),
+        getAvailable: () => [],
+      },
+    };
+
+    const handler = commands.get("duo")!;
+    for (const onSessionStart of events.get("session_start") || []) {
+      await onSessionStart({}, ctx);
+    }
+    await handler("start --peer provider-b/model/b", ctx);
+    assert.equal(overlayOpens, 1, "workbench auto-opens on start");
+
+    // Hide it first: the user explicitly closed the workbench, so history must
+    // not bring it back. This is the guard against over-restoring.
+    await handler("view", ctx);
+
+    const before = overlayOpens;
+    const historyPromise = handler("history", ctx);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(dismissTopModal, "history opened");
+    dismissTopModal!();
+    await historyPromise;
+
+    assert.equal(
+      overlayOpens,
+      before + 1,
+      "history opened but the hidden workbench was NOT restored",
+    );
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("automatic workbench opening stays silent in a non-TUI host", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-workbench-silent-"));
+  try {
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+
+    const commands = new Map<string, (args: string, ctx: any) => Promise<any>>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const notices: Array<{ message: string; type?: string }> = [];
+
+    // A RPC/print-style host: `notify` exists but there is no `custom`, so
+    // the workbench genuinely cannot be displayed.
+    const ui = {
+      notify: (message: string, type?: string) => { notices.push({ message, type }); },
+      setStatus: () => {},
+      setWidget: () => {},
+    };
+
+    const api = {
+      registerTool() {},
+      registerCommand(name: string, command: { handler: any }) {
+        commands.set(name, command.handler);
+      },
+      registerMessageRenderer() {},
+      sendMessage() {},
+      on(name: string, handler: any) {
+        if (!events.has(name)) events.set(name, []);
+        events.get(name)!.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+
+    piDuo(api);
+
+    const handler = commands.get("duo");
+    assert.ok(handler);
+
+    // Resuming an active session is an *automatic* open point: the user never
+    // asked for the workbench. In a non-TUI host this must degrade silently
+    // rather than emitting an unsolicited error.
+    for (const onSessionStart of events.get("session_start") || []) {
+      await onSessionStart({}, {
+        cwd,
+        mode: "rpc",
+        ui,
+        sessionManager: {
+          getSessionId: () => "mock-session-id",
+          getSessionFile: () => undefined,
+        },
+        modelRegistry: { find: () => undefined, getAvailable: () => [] },
+        isIdle: () => true,
+        abort: () => {},
+      });
+    }
+
+    assert.equal(
+      notices.filter((n) => /requires TUI mode/.test(n.message)).length,
+      0,
+      "automatic open must not report a TUI-mode error",
+    );
+
+    // An explicit request, by contrast, is allowed to explain the limitation.
+    await handler("workbench", {
+      cwd,
+      mode: "rpc",
+      ui,
+      isIdle: () => true,
+      abort: () => {},
+      sessionManager: {
+        getSessionId: () => "mock-session-id",
+        getSessionFile: () => undefined,
+      },
+      modelRegistry: { find: () => undefined, getAvailable: () => [] },
+    });
+
+    assert.ok(
+      notices.some((n) => /requires TUI mode/.test(n.message)),
+      "an explicit /duo workbench request should explain the limitation",
+    );
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("streaming deltas coalesce workbench redraws without delaying the first frame", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-workbench-throttle-"));
+  const originalReadState = DuoStore.prototype.readState;
+  try {
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+
+    // Count every disk-backed state read. The render path must not call this:
+    // it renders from the in-memory accumulator.
+    let reads = 0;
+    DuoStore.prototype.readState = function (this: DuoStore, ...args: any[]) {
+      reads++;
+      return (originalReadState as any).apply(this, args);
+    };
+
+    const commands = new Map<string, (args: string, ctx: any) => Promise<any>>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    let renderRequests = 0;
+    let panel: any;
+    const ui = {
+      notify: () => {},
+      setStatus: () => {},
+      setWidget: () => {},
+      custom: (factory: any) => {
+        const tui = {
+          requestRender: () => { renderRequests++; },
+          terminal: { rows: 40, columns: 120 },
+        };
+        panel = factory(tui, {}, {}, () => {});
+        return new Promise<void>(() => {});
+      },
+    };
+
+    const api = {
+      registerTool() {},
+      registerCommand(name: string, command: { handler: any }) {
+        commands.set(name, command.handler);
+      },
+      registerMessageRenderer() {},
+      sendMessage() {},
+      on(name: string, handler: any) {
+        if (!events.has(name)) events.set(name, []);
+        events.get(name)!.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+
+    piDuo(api);
+
+    const ctx = {
+      cwd,
+      mode: "tui",
+      ui,
+      isIdle: () => true,
+      abort: () => {},
+      model: { provider: "provider-a", id: "model/a" },
+      hasUI: true,
+      sessionManager: {
+        getSessionId: () => "mock-session-id",
+        getSessionFile: () => undefined,
+      },
+      modelRegistry: {
+        find: () => ({ provider: "provider-b", id: "model/b" }),
+        getAvailable: () => [],
+      },
+    };
+
+    for (const onSessionStart of events.get("session_start") || []) {
+      await onSessionStart({}, ctx);
+    }
+    await commands.get("duo")!("start --peer provider-b/model/b", ctx);
+
+    // Measure only the streaming burst.
+    reads = 0;
+
+    const DELTAS = 300;
+    for (const onStart of events.get("message_start") || []) {
+      onStart({ message: { role: "assistant" } });
+    }
+    assert.equal(renderRequests, 1, "message_start renders the first frame immediately");
+    for (let i = 0; i < DELTAS; i++) {
+      for (const onUpdate of events.get("message_update") || []) {
+        onUpdate({
+          message: { role: "assistant" },
+          assistantMessageEvent: {
+            type: "text_delta",
+            contentIndex: 0,
+            delta: "x",
+          },
+        });
+      }
+    }
+
+    assert.equal(renderRequests, 1, "a synchronous delta burst is coalesced");
+
+    // The regression this guards: an unthrottled path read the store once per
+    // delta per agent. Anything close to DELTAS means the throttle is dead.
+    assert.ok(
+      reads < 10,
+      `${DELTAS} deltas caused ${reads} disk reads; the throttle is not holding`,
+    );
+
+    // One trailing repaint catches the final delta without rebuilding the
+    // entire native component tree once per token.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(renderRequests, 2, "the final delta gets one trailing render");
+
+    // Each update is a distinct assistant object. It must replace the one
+    // start entry, not become another visible transcript message.
+    const started = {
+      role: "assistant",
+      content: [{ type: "text", text: "stream started" }],
+    };
+    const finished = {
+      role: "assistant",
+      content: [{ type: "text", text: "stream finished" }],
+    };
+    for (const onStart of events.get("message_start") || []) {
+      onStart({ message: started });
+    }
+    for (const onUpdate of events.get("message_update") || []) {
+      onUpdate({
+        message: { role: "assistant", content: [{ type: "text", text: "delta" }] },
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "delta" },
+      });
+    }
+    for (const onEnd of events.get("message_end") || []) {
+      onEnd({ message: finished });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const transcript = (panel as any).austinDocument.render(59).join("\n");
+    assert.equal((transcript.match(/stream finished/g) || []).length, 1);
+
+    // SessionManager may return a cloned object, so identity-only merging must
+    // not render the same user turn twice either.
+    const userText = "same user turn";
+    for (const onStart of events.get("message_start") || []) {
+      onStart({ message: { role: "user", content: userText } });
+    }
+    for (const onEnd of events.get("message_end") || []) {
+      onEnd({ message: { role: "user", content: userText } });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const userTranscript = (panel as any).austinDocument.render(59).join("\n");
+    assert.equal((userTranscript.match(/same user turn/g) || []).length, 1);
+
+    // Native transcript rendering has no store-backed footer, so the stream
+    // must not schedule a trailing disk read either.
+    assert.equal(reads, 0, `native transcript unexpectedly read state ${reads} times`);
+  } finally {
+    DuoStore.prototype.readState = originalReadState;
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+// --- Bug: the write guard leaked across sessions ----------------------------
+
+/**
+ * Builds an extension harness on a fresh temp cwd and returns the captured
+ * `tool_call` handlers plus the store, so write-guard behavior can be asserted
+ * directly. `sessionId` is what pi's `sessionManager.getSessionId()` reports
+ * for the *current* session - the whole point of these tests is to make it
+ * differ from the session recorded in the shared duo state.
+ */
+async function writeGuardHarness(options: {
+  sessionId: string;
+  recordedAustinSessionId: string;
+  status?: "active" | "stopped";
+  tonyInitialContribution?: boolean;
+}) {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-guard-test-"));
+  const store = new DuoStore(cwd);
+  await store.create(
+    { provider: "provider-a", modelId: "model/a" },
+    { provider: "provider-b", modelId: "model/b" },
+  );
+  await store.update((draft) => {
+    draft.agents.austin.sessionId = options.recordedAustinSessionId;
+    draft.status = options.status ?? "active";
+    draft.workspaceOwner = "austin";
+    draft.collaboration = {
+      userTurn: 1,
+      phase: "explore",
+      austinContributed: true,
+      tonyContributed: false,
+      tonyInitialContribution: options.tonyInitialContribution ?? false,
+      contested: false,
+      planRevision: 0,
+    };
+  });
+
+  const events = new Map<string, Array<(...args: any[]) => any>>();
+  const api = {
+    registerTool() {},
+    registerCommand() {},
+    registerMessageRenderer() {},
+    sendMessage() {},
+    on(name: string, handler: any) {
+      if (!events.has(name)) events.set(name, []);
+      events.get(name)!.push(handler);
+    },
+  } as unknown as ExtensionAPI;
+
+  piDuo(api);
+
+  for (const handler of events.get("session_start") || []) {
+    await handler({}, {
+      cwd,
+      sessionManager: { getSessionId: () => options.sessionId },
+      modelRegistry: { find: () => undefined },
+      ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+    });
+  }
+
+  const callTool = async (toolName: string, input: unknown) => {
+    const handlers = events.get("tool_call") || [];
+    for (const handler of handlers) {
+      const result = await handler({ toolName, toolCallId: "c1", input });
+      if (result) return result;
+    }
+    return undefined;
+  };
+
+  return { cwd, store, callTool };
+}
+
+test("write guard does not lock a session that does not own the duo run", async () => {
+  // The recorded Austin session is someone else's; the current session merely
+  // shares the cwd. Leaving the guard armed here is what blocked an unrelated
+  // Pi session in the same directory from editing any file.
+  const { callTool } = await writeGuardHarness({
+    sessionId: "current-session",
+    recordedAustinSessionId: "other-session",
+  });
+
+  assert.equal(
+    await callTool("edit", { path: "index.ts", oldText: "a", newText: "b" }),
+    undefined,
+    "a non-owner session must be able to write",
+  );
+  assert.equal(
+    await callTool("write", { path: "index.ts", content: "x" }),
+    undefined,
+    "a non-owner session must be able to write",
+  );
+  assert.equal(
+    await callTool("bash", { command: "touch probe.txt" }),
+    undefined,
+    "a non-owner session must be able to run a mutating shell command",
+  );
+});
+
+test("write guard does not lock writes once the duo run is stopped", async () => {
+  // `/duo stop` only flips `status` and leaves `collaboration` in EXPLORE.
+  // The phase constraint must not outlive the run it belongs to.
+  const { callTool } = await writeGuardHarness({
+    sessionId: "owner-session",
+    recordedAustinSessionId: "owner-session",
+    status: "stopped",
+  });
+
+  assert.equal(
+    await callTool("edit", { path: "index.ts", oldText: "a", newText: "b" }),
+    undefined,
+    "a stopped run must not keep gating writes",
+  );
+  assert.equal(
+    await callTool("bash", { command: "mkdir -p out" }),
+    undefined,
+    "a stopped run must not keep gating mutating shell commands",
+  );
+});
+
+test("write guard still enforces the EXPLORE barrier for the owning session", async () => {
+  // The negative case: the fix must not disarm the real collaboration barrier.
+  const { callTool } = await writeGuardHarness({
+    sessionId: "owner-session",
+    recordedAustinSessionId: "owner-session",
+  });
+
+  const edit = await callTool("edit", {
+    path: "index.ts",
+    oldText: "a",
+    newText: "b",
+  });
+  assert.ok(edit, "the owning session is still blocked in EXPLORE");
+  assert.equal(edit.block, true);
+  assert.match(edit.reason, /EXPLORE|Barrier/i);
+
+  const readOnly = await callTool("bash", { command: "git status" });
+  assert.equal(readOnly, undefined, "read-only shell is never blocked");
+});
+
+test("write guard still blocks the owner in EXPLORE after Tony contributes", async () => {
+  // EXPLORE never permits writes for Austin: Tony's initial contribution only
+  // changes which barrier message is shown (it lifts the First Collaboration
+  // Barrier and leaves the CONVERGE requirement). Only EXECUTE opens writes.
+  const { callTool } = await writeGuardHarness({
+    sessionId: "owner-session",
+    recordedAustinSessionId: "owner-session",
+    tonyInitialContribution: true,
+  });
+
+  const edit = await callTool("edit", {
+    path: "index.ts",
+    oldText: "a",
+    newText: "b",
+  });
+  assert.ok(edit, "EXPLORE still blocks the owning session");
+  assert.equal(edit.block, true);
+  assert.match(edit.reason, /EXPLORE/);
+  assert.doesNotMatch(edit.reason, /First Collaboration Barrier/);
+});
+
+test("write guard permits the owner to write in EXECUTE", async () => {
+  const { store, callTool } = await writeGuardHarness({
+    sessionId: "owner-session",
+    recordedAustinSessionId: "owner-session",
+  });
+  await store.update((draft) => {
+    draft.collaboration!.phase = "execute";
+  });
+
+  assert.equal(
+    await callTool("edit", { path: "index.ts", oldText: "a", newText: "b" }),
+    undefined,
+    "the owning session may write in EXECUTE",
+  );
+});
+
+test("/duo stop clears the collaboration block so the write gate cannot outlive the run", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-stop-gate-"));
+  try {
+    const store = new DuoStore(cwd);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-b", modelId: "model/b" },
+    );
+    // An armed EXPLORE gate that would block every writer in this directory.
+    await store.update((draft) => {
+      draft.agents.austin.sessionId = "mock-session-id";
+      draft.status = "active";
+      draft.workspaceOwner = "austin";
+      draft.collaboration = {
+        userTurn: 1,
+        phase: "explore",
+        austinContributed: false,
+        tonyContributed: false,
+        tonyInitialContribution: false,
+        contested: false,
+        planRevision: 0,
+      };
+    });
+
+    const commands = new Map<string, (args: string, ctx: any) => Promise<void>>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const api = {
+      registerTool() {},
+      registerCommand(name: string, command: { handler: any }) {
+        commands.set(name, command.handler);
+      },
+      registerMessageRenderer() {},
+      sendMessage() {},
+      on(name: string, handler: any) {
+        if (!events.has(name)) events.set(name, []);
+        events.get(name)!.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+
+    piDuo(api);
+
+    const ctx = {
+      cwd,
+      sessionManager: { getSessionId: () => "mock-session-id" },
+      modelRegistry: { find: () => undefined },
+      ui: {
+        notify: () => {},
+        setStatus: () => {},
+        setWidget: () => {},
+        hideOverlay: () => {},
+        custom: async () => ({ hidden: Promise.resolve() }),
+      },
+      isIdle: () => true,
+      abort: () => {},
+    };
+
+    for (const handler of events.get("session_start") || []) {
+      await handler({}, ctx);
+    }
+
+    const handler = commands.get("duo");
+    assert.ok(handler, "/duo command must be registered");
+
+    const before = await store.readState();
+    assert.match(
+      String(
+        workspaceMutationBlockReason(
+          "austin",
+          before?.collaboration,
+          before?.workspaceOwner ?? null,
+        ),
+      ),
+      /EXPLORE|Barrier/,
+      "precondition: the active run really is gating writes",
+    );
+
+    await handler("stop", ctx);
+
+    const after = await store.readState();
+    assert.equal(after?.status, "stopped");
+    // Regression: `/duo stop` used to flip only `status`, leaving
+    // `collaboration.phase === "explore"` behind. Every later session in this
+    // cwd was then permanently blocked from writing files.
+    assert.equal(
+      after?.collaboration,
+      undefined,
+      "stop must clear the collaboration block",
+    );
+    assert.equal(after?.workspaceOwner, null, "stop must release the lock");
+    assert.equal(
+      workspaceMutationBlockReason(
+        "austin",
+        after?.collaboration,
+        after?.workspaceOwner ?? null,
+      ),
+      undefined,
+      "a stopped run must not gate writes",
+    );
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
