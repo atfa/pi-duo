@@ -1,6 +1,6 @@
 {
   "name": "pi-duo",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "private": true,
   "type": "module",
   "description": "Two persistent peer agents collaborating inside Pi Coding Agent",

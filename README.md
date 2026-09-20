@@ -12,11 +12,11 @@
 <p align="center">
   <a href="https://github.com/atfa/pi-duo"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-atfa%2Fpi--duo-181717?logo=github"></a>
   <img alt="Pi" src="https://img.shields.io/badge/Pi-%E2%89%A5%200.85.1-7C3AED">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.3.3-00C2A8">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.3.4-00C2A8">
   <img alt="Tests" src="https://img.shields.io/badge/tests-passing-22C55E">
 </p>
 
-> **0.3.3 提示**：Execution Gate 现在约束当前 workspace owner：无论 owner 是 Austin 还是 Tony，只有 `EXECUTE` 可以修改集成工作区；Tony scratch 写入仍可用。degraded 只放宽 Austin 的 `EXPLORE/CONVERGE` 协作屏障，`VERIFY/COMPLETE` 仍冻结；Tony 不可用时不能创建 pending review。
+> **0.3.4 提示**：双栏工作台现在采用固定布局、单侧节流刷新与有界可视历史，长会话更稳定。任务彻底完成后，顶部会持续显示 `✓ pi-duo 协作任务彻底完成`；该状态可跨 reload 恢复，不会重复唤醒 Austin。
 
 ## 为什么需要 pi-duo？
 
@@ -60,11 +60,13 @@ flowchart LR
 - **真实 context 通信**：`duo_send` 把消息写入 peer 的持久会话。
 - **后台自动协作**：默认每条普通用户任务都会同时派发给 Tony。
 - **审查完成门控**：Tony 首份报告到达前，Austin 的终稿会明确标为预备结果；报告到达后自动唤醒 Austin 收口。
+- **明确完成信号**：Austin 最终收口且共享 todo 全部关闭后，双栏顶部显示持久完成横幅；下一条用户任务开始时自动清除。
 - **共享工作面**：goal、todo、decisions、消息审计和 workspace owner 持久化在项目内。
 - **默认单写者**：`austin-only` 模式固定 Austin 为项目文件写入者。
 - **高级可转移写锁**：`transferable` 模式允许双方显式交接 workspace ownership。
 - **循环保护**：总消息预算、连续 peer-only 限制、相似消息抑制、关键消息 deferred 槽。
 - **可靠恢复**：`/duo stop` 保留历史，`/duo resume` 恢复两个 session。
+- **中断续接**：若进程停在“Tony 已验收、Austin 尚未最终回复”，reload/resume 会自动恢复最后收口；已 finalized 的任务不会重复执行。
 - **并发安全**：revision、原子 rename、跨进程锁和 stale-lock recovery。
 
 ## 环境要求
@@ -257,10 +259,13 @@ Pi 原生 `/resume` 与 `/duo resume` 解决的是两件不同的事：
 
 视图形态：**上半屏为双栏原生 transcript**（左栏 Austin、右栏 Tony）。姓名下方固定显示双方的模型、交谈次数和分角色工作状态，避免被动态增高的 Pi 底部 dock 覆盖。两栏直接复用 Pi 的 assistant、user 与 tool 组件，历史恢复、流式 thinking、工具执行中的状态与工具结果都按普通 Pi 会话显示；`duo_send` 只是 session 中的一条普通消息。**下半屏保持 Austin 的 Pi 输入框、status 与 footer**，输入只发送给 Austin。
 
+任务真正完成时，姓名分割线下方会固定显示 `✓ pi-duo 协作任务彻底完成`。这是工作台自身的持久完成通知，不是可能被 overlay 遮住的 Pi 临时弹窗；看到该横幅即表示 Tony 已验收、Austin 已完成最终收口且没有未关闭 todo。下一条普通用户任务开始后横幅自动消失。
+
 关键性质与限制：
 
 - **不抢键盘焦点（non-capturing）**：面板常驻显示时输入框仍然可用，你可以一边看双栏一边直接输入下一个任务。
 - **各栏独立滚动**：Austin 与 Tony 各有一个原生 `ScrollView`，持续跟随各自 session 的最新输出。
+- **有界、按侧刷新**：实时视图只保留最近 40 条可视消息，并且只重建发生变化的一栏；完整 session 历史仍保存在磁盘，不受该显示上限影响。
 - **无法做到"真·分屏"**：Pi 的弹性上半区只属于其内部的 transcript 滚动区，扩展 API 无法替换它。因此本视图是覆盖在上半屏的非捕获面板，视觉上等同分屏，但机制上不是把 chat 区域替换掉；`/duo view` 可随时隐藏。
 
 ### 创建新的 Duo
@@ -317,6 +322,8 @@ Pi 默认的 `ESC` 是“取消或中止”键。Austin 正在前台生成时，
 这里没有选择列表是有意的：Duo 状态已经保存了两个 session 的 ID 和文件路径，用户无需再次配对。如果想恢复另一段普通 Pi session，请使用 Pi 原生 `/resume`；如果想把它建立成一组新的 Duo，请在那个 session 中执行 `/duo start`。
 
 正常的 `/duo resume` **不会自动开始新任务，也不会在没有用户提示词时让双方继续闲置工作**。`autoDispatch=true` 只在用户提交一条非命令文本时，才把该任务同时调度给 Tony。例外只有未完成的旧控制流程：恢复时若发现被打断的 `pending` Tony review，或 Tony 已验收但 Austin 尚未完成最终回复，pi-duo 会自动唤醒 Austin 收口；不会创建新任务。
+
+如果状态已经持久化为 finalized，`/reload` 和 `/duo resume` 只恢复双栏及完成横幅，不会再次唤醒 Austin。若看到双方“已完成”但尚无完成横幅，则表示最终完成记录尚未落盘，pi-duo 会继续一次收口回合。
 
 ### 崩溃或重启后的推荐恢复步骤
 
@@ -671,7 +678,7 @@ assets/pi-duo-xhs.png    3:4 宣传图
 
 ## 项目状态
 
-当前定位：**v0.2.0 beta / release candidate**。
+当前定位：**v0.3.4 beta / release candidate**。
 
 已经过以下真实场景验证：
 
