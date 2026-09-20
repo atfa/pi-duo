@@ -155,7 +155,10 @@ export class DuoTranscript implements Component {
         new Text(this.tonyFooter[index] ?? "·", 1, 0),
       ).render(width)[0] ?? "");
     }
-    return [header, rule, ...body, rule, ...footer, rule];
+    // Keep metadata next to the top-anchored header. Pi's bottom dock can grow
+    // while tools/widgets update; footer rows placed at the overlay's lower
+    // edge were intermittently painted over by that dock.
+    return [header, rule, ...footer, rule, ...body, rule];
   }
 
   invalidate(): void {

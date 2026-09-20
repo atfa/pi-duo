@@ -38,7 +38,7 @@ test("DuoTranscript splits columns evenly and draws both separators", () => {
   const rows = transcript.render(101).map(stripTerminalSequences);
   assert.equal(rows[0].indexOf("│"), 50);
   assert.equal(rows[1], "─".repeat(101));
-  assert.equal(rows.at(-5), "─".repeat(101));
+  assert.equal(rows[5], "─".repeat(101));
   assert.equal(rows.at(-1), "─".repeat(101));
 });
 
@@ -50,7 +50,7 @@ test("DuoTranscript keeps short Austin content when Tony grows taller", () => {
       label: "Austin",
       cwd: process.cwd(),
       messages: [{ ...assistant, content: [{ type: "text", text: "Austin stays visible" }] }],
-      footer: ["模型  Austin", "交谈  Austin → Tony 0", "状态  · Austin 待命"],
+      footer: ["模型  Austin", "交谈  Austin → Tony 0", "状态  · Austin 等待任务"],
     },
     {
       label: "Tony",
@@ -59,7 +59,7 @@ test("DuoTranscript keeps short Austin content when Tony grows taller", () => {
         ...assistant,
         content: [{ type: "text", text: `Tony row ${index}` }],
       })),
-      footer: ["模型  Tony", "交谈  Tony → Austin 0", "状态  · Tony 待命"],
+      footer: ["模型  Tony", "交谈  Tony → Austin 0", "状态  · Tony 等待任务"],
     },
   );
 
@@ -71,12 +71,12 @@ test("DuoTranscript keeps short Austin content when Tony grows taller", () => {
   assert.equal(rows[1], "─".repeat(100));
   assert.match(output, /Austin stays visible/);
   assert.match(output, /Tony row 7/);
-  assert.ok(rows.slice(2, 5).every((row) => row.indexOf("│") === 49));
+  assert.ok(rows.slice(6, 9).every((row) => row.indexOf("│") === 49));
   assert.equal(rows[5], "─".repeat(100));
-  assert.match(rows[6], /模型  Austin/);
-  assert.match(rows[6], /模型  Tony/);
-  assert.match(rows[8], /Austin 待命/);
-  assert.match(rows[8], /Tony 待命/);
+  assert.match(rows[2], /模型  Austin/);
+  assert.match(rows[2], /模型  Tony/);
+  assert.match(rows[4], /Austin 等待任务/);
+  assert.match(rows[4], /Tony 等待任务/);
   assert.equal(rows[0].indexOf("│"), 49);
   assert.equal(rows.at(-1), "─".repeat(100));
 });

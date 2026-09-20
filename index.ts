@@ -64,6 +64,51 @@ import type {
 } from "./src/types.js";
 import { DuoTranscript, type LiveToolState } from "./src/workbench.js";
 
+const TRANSCRIPT_MESSAGE_LIMIT = 80;
+
+/** Cheap display-only identity; never serialize an entire model/tool payload. */
+export function transcriptMessageKey(message: any): string {
+  const parts = [
+    String(message?.role ?? ""),
+    String(message?.timestamp ?? ""),
+    String(message?.toolCallId ?? ""),
+    String(message?.stopReason ?? ""),
+    message?.isError ? "1" : "0",
+  ];
+  const content = message?.content;
+  const items = Array.isArray(content) ? content : [content];
+  for (const item of items.slice(0, 32)) {
+    if (typeof item === "string") {
+      parts.push(`s:${item.length}:${item.slice(0, 24)}:${item.slice(-24)}`);
+      continue;
+    }
+    if (!item || typeof item !== "object") {
+      parts.push(String(item));
+      continue;
+    }
+    const text = typeof item.text === "string" ? item.text : "";
+    parts.push(
+      `${item.type ?? ""}:${item.id ?? ""}:${item.name ?? ""}:` +
+      `${text.length}:${text.slice(0, 24)}:${text.slice(-24)}`,
+    );
+  }
+  parts.push(`n:${items.length}`);
+  return parts.join("\u0000");
+}
+
+export function dedupeTranscriptMessages(messages: readonly any[]): any[] {
+  const recent = messages.slice(-TRANSCRIPT_MESSAGE_LIMIT);
+  const seen = new Set<string>();
+  const unique: any[] = [];
+  for (const message of recent) {
+    const key = transcriptMessageKey(message);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(message);
+  }
+  return unique;
+}
+
 const BASE_POLICY = `## Duo collaboration policy
 You are one of two peer coding agents collaborating on the same goal. Your peer is an independent reasoning agent, not your subordinate.
 Do not agree automatically. Challenge weak assumptions with code inspection, discriminating tests, or evidence.
@@ -344,6 +389,7 @@ export default function piDuo(pi: ExtensionAPI) {
   let tonyMustYield = false;
   let activeTonyUserTurn: number | undefined;
   let completionReconcileTurn = -1;
+  let completionNotifiedTurn = -1;
   let extensionActive = true;
   let lifecycleGeneration = 0;
   let foregroundUI: ExtensionUIContext | undefined;
@@ -355,6 +401,7 @@ export default function piDuo(pi: ExtensionAPI) {
     | "working"
     | "waiting"
     | "complete"
+    | "finalized"
     | "failed"
     | "collaboration-failed"
     | "clear" = "clear";
@@ -401,7 +448,6 @@ export default function piDuo(pi: ExtensionAPI) {
   let workbenchRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let lastWorkbenchRefreshAt = 0;
   const WORKBENCH_REFRESH_MS = 100;
-  const WORKBENCH_MESSAGE_LIMIT = 80;
   const DEFAULT_PANEL_ROWS = 12;
   // Header + header rule + metadata rule + 3 metadata rows + bottom rule.
   const MIN_PANEL_ROWS = 7;
@@ -435,40 +481,30 @@ export default function piDuo(pi: ExtensionAPI) {
     const messages = historical.length
       ? historical
       : session?.messages ?? session?.buildSessionContext?.().messages ?? [];
-    const messageKey = (message: any): string => {
-      try {
-        return JSON.stringify([
-          message?.role,
-          message?.toolCallId,
-          message?.content,
-          message?.stopReason,
-          message?.isError,
-        ]);
-      } catch {
-        return `${message?.role ?? ""}:${String(message)}`;
-      }
-    };
-    const known = new Set(messages);
-    const knownKeys = new Set(messages.map(messageKey));
-    const pending = captured.filter((message) =>
-      !known.has(message) && !knownKeys.has(messageKey(message))
+    // Bound first. The previous implementation serialized and quadratically
+    // compared the complete session on every stream delta, eventually taking
+    // V8 down with an out-of-memory abort on long sessions.
+    const recentMessages = messages.slice(-TRANSCRIPT_MESSAGE_LIMIT);
+    const known = new Set(recentMessages);
+    const knownKeys = new Set(recentMessages.map(transcriptMessageKey));
+    const pending = captured.slice(-TRANSCRIPT_MESSAGE_LIMIT).filter((message) =>
+      !known.has(message) && !knownKeys.has(transcriptMessageKey(message))
     );
     captured.splice(0, captured.length, ...pending);
     if (
       streaming &&
       !known.has(streaming) &&
-      !knownKeys.has(messageKey(streaming)) &&
+      !knownKeys.has(transcriptMessageKey(streaming)) &&
       !pending.includes(streaming)
     )
       pending.push(streaming);
-    const all = pending.length ? [...messages, ...pending] : messages;
-    const unique = all.filter((message: any, index: number, source: any[]) =>
-      source.findIndex((candidate: any) => messageKey(candidate) === messageKey(message)) === index
+    const unique = dedupeTranscriptMessages(
+      pending.length ? [...recentMessages, ...pending] : recentMessages,
     );
     // The overlay is a live view, not another session history. Bound its
     // component tree; if a cut starts on orphaned tool results, omit those
     // results rather than rendering a misleading unpaired native tool row.
-    const recent = unique.slice(-WORKBENCH_MESSAGE_LIMIT);
+    const recent = unique;
     const callIds = new Set(
       recent.flatMap((message: any) => message?.role === "assistant"
         ? (Array.isArray(message.content) ? message.content : [])
@@ -484,14 +520,42 @@ export default function piDuo(pi: ExtensionAPI) {
   };
 
   const workbenchFooter = (side: "austin" | "tony"): readonly string[] => {
-    const active = reviewIndicatorPhase === "working" || reviewIndicatorPhase === "collaborating";
+    let status: string;
+    let active = false;
+    switch (reviewIndicatorPhase) {
+      case "collaborating":
+        active = true;
+        status = side === "austin" ? "Austin 正在工作" : "Tony 正在后台协作";
+        break;
+      case "working":
+        active = side === "tony";
+        status = side === "austin" ? "Austin 等待 Tony" : "Tony 正在验证";
+        break;
+      case "waiting":
+        active = side === "austin";
+        status = side === "austin" ? "Austin 正在处理反馈" : "Tony 等待 Austin";
+        break;
+      case "complete":
+        active = side === "austin";
+        status = side === "austin" ? "Austin 正在最终收口" : "Tony 已验收";
+        break;
+      case "finalized":
+        status = side === "austin" ? "Austin 已完成" : "Tony 已完成";
+        break;
+      case "failed":
+        status = side === "austin" ? "Austin 等待处理异常" : "Tony 验证失败";
+        break;
+      case "collaboration-failed":
+        status = side === "austin" ? "Austin 单独工作" : "Tony 协作异常";
+        active = side === "austin";
+        break;
+      default:
+        status = side === "austin" ? "Austin 等待任务" : "Tony 等待任务";
+    }
     const icon = active ? (side === "austin" ? "◐" : "◑") : "·";
     const model = side === "austin"
       ? (config?.agentA ? modelText(config.agentA) : "Austin")
       : (config?.agentB ? modelText(config.agentB) : "Tony");
-    const status = active
-      ? side === "austin" ? "Austin 正在工作" : "Tony 正在后台协作"
-      : side === "austin" ? "Austin 待命" : "Tony 待命";
     return [
       `模型  ${model}`,
       side === "austin"
@@ -549,6 +613,7 @@ export default function piDuo(pi: ExtensionAPI) {
       | "working"
       | "waiting"
       | "complete"
+      | "finalized"
       | "failed"
       | "collaboration-failed"
       | "clear",
@@ -567,12 +632,6 @@ export default function piDuo(pi: ExtensionAPI) {
       reviewIndicatorStartedAt = Date.now();
     if (phase === "clear") reviewIndicatorStartedAt = 0;
     renderReviewIndicator(phase === "complete");
-    if (phase === "complete" && wasActive) {
-      foregroundUI?.notify(
-        "Duo 协作已完成，可以继续输入。",
-        "info",
-      );
-    }
   };
 
   const showHistory = async (ctx: ExtensionCommandContext) => {
@@ -2551,7 +2610,22 @@ export default function piDuo(pi: ExtensionAPI) {
     )
       return;
     const ids = openCompletionTodoIds(state);
-    if (!ids.length) return;
+    if (!ids.length) {
+      const completionTurn = state.userTurn ?? guard.turn;
+      if (
+        state.collaboration?.phase === "complete" &&
+        state.review?.status === "reported" &&
+        completionNotifiedTurn !== completionTurn
+      ) {
+        completionNotifiedTurn = completionTurn;
+        setReviewIndicator("finalized");
+        foregroundUI?.notify(
+          "Duo 任务已彻底完成：Austin 已收口，Tony 已验收。",
+          "info",
+        );
+      }
+      return;
+    }
     completionReconcileTurn = guard.turn;
     sendMessageSafely(
       {

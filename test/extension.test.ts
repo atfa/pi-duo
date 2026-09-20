@@ -4,7 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import piDuo from "../index.js";
+import piDuo, {
+  dedupeTranscriptMessages,
+  transcriptMessageKey,
+} from "../index.js";
 import {
   isBlockedByFirstSyncBarrier,
   workspaceMutationBlockReason,
@@ -12,6 +15,28 @@ import {
 import { DuoStore } from "../src/store.js";
 
 initTheme(undefined, false);
+
+test("transcript dedupe is bounded and never serializes full payloads", () => {
+  const make = (index: number) => ({
+    role: "assistant",
+    timestamp: String(index),
+    content: [{
+      type: "text",
+      text: `message-${index}-${"x".repeat(10_000)}`,
+      toJSON() { throw new Error("full serialization is forbidden"); },
+    }],
+  });
+  const messages = Array.from({ length: 200 }, (_, index) => make(index));
+  const last = messages.at(-1)!;
+  const duplicate = {
+    ...last,
+    content: [{ type: "text", text: last.content[0].text }],
+  };
+  assert.doesNotThrow(() => transcriptMessageKey(messages[0]));
+  const unique = dedupeTranscriptMessages([...messages, duplicate]);
+  assert.ok(unique.length <= 80);
+  assert.equal(unique.filter((message) => message.timestamp === "199").length, 1);
+});
 
 test("extension registers commands, tools, renderer, and lifecycle hooks without network access", () => {
   const tools: string[] = [];
@@ -142,6 +167,7 @@ test("duo_plan and duo_checkpoint enforce strict phase transitions", async () =>
 
     const tools = new Map<string, (id: string, params: any) => Promise<any>>();
     const events = new Map<string, Array<(...args: any[]) => any>>();
+    const notices: string[] = [];
     const api = {
       registerTool(tool: { name: string; execute: any }) {
         tools.set(tool.name, tool.execute);
@@ -162,7 +188,7 @@ test("duo_plan and duo_checkpoint enforce strict phase transitions", async () =>
         cwd,
         sessionManager: { getSessionId: () => "mock-session-id" },
         modelRegistry: { find: () => undefined },
-        ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+        ui: { notify: (message: string) => notices.push(message), setStatus: () => {}, setWidget: () => {} },
       });
     }
 
@@ -223,6 +249,18 @@ test("duo_plan and duo_checkpoint enforce strict phase transitions", async () =>
     assert.match(completeOk.content[0].text, /Collaboration marked complete/i);
     state = await store.readState();
     assert.equal(state?.collaboration?.phase, "complete");
+    assert.equal(
+      notices.filter((message) => /彻底完成/.test(message)).length,
+      0,
+      "verification completion must not notify before Austin's final turn ends",
+    );
+    for (const handler of events.get("agent_end") || []) await handler();
+    for (const handler of events.get("agent_end") || []) await handler();
+    assert.equal(
+      notices.filter((message) => /彻底完成/.test(message)).length,
+      1,
+      "the final completion notification is emitted once",
+    );
 
     // 8. Reopen returns to EXECUTE and clears review
     const reopenOk = await checkpointExecute("7", { action: "reopen" });

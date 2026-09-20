@@ -212,7 +212,30 @@ Workspace write owner: Austin
 
 安装或加载扩展不会自动进入 Duo 模式。`/duo start` 会创建 Duo 状态，并把当前 Pi session 绑定为 Austin；只有这个 session 会显示 Duo 状态、注入协作提示并自动调度 Tony。同一工作目录中其他普通 Pi session 不会继承这些行为。
 
-不带 agent 名称的 `/duo stop` 会完整退出 Duo 模式、中止双方当前回合并清除状态提示。之后可用 `/duo resume` 回到已保存的 Austin session 并重新进入 Duo 模式。`/duo stop austin` 和 `/duo stop tony` 只是定向中止其中一方，不退出整个 Duo 模式。
+Pi 原生 `/resume` 与 `/duo resume` 解决的是两件不同的事：
+
+- `/resume` 从 Pi 保存的 session 中选择并恢复**一个前台 session**。它不知道 Austin/Tony 的配对关系，也不会单独恢复 Tony。
+- `/duo resume` 恢复当前工作目录 `.pi-duo/state.json` 中记录的**一整对 Austin/Tony session**。每个工作目录当前只有一份 Duo 状态，因此它没有、也不需要 session 选择列表。
+
+不带 agent 名称的 `/duo stop` 会完整退出 Duo 模式、中止双方当前回合并清除状态提示。`/duo stop austin` 和 `/duo stop tony` 只是定向中止其中一方，不退出整个 Duo 模式。
+
+### 命令速查
+
+| 命令 | 用途 | 中止工作 | 自动触发模型继续工作 |
+|---|---|---|---|
+| `/duo`、`/duo status` | 显示当前 Duo 状态 | 否 | 否 |
+| `/duo start ...` | 新建 Duo，并把当前 session 设为 Austin | 会替换可安全重建的旧状态 | 否，等待用户输入任务 |
+| `/duo resume` | 恢复状态中固定的 Austin/Tony session | 否 | 通常否；仅处理中断中的 review，见下文 |
+| `/duo stop` | 停止 Austin、Tony 和整个 Duo | 是，双方 | 否 |
+| `/duo stop austin` | 只停止 Austin 当前回合 | 是，仅 Austin | 否 |
+| `/duo stop tony` | 只停止 Tony，Duo 降级运行 | 是，仅 Tony | 会通知正在运行的 Austin 已降级 |
+| `/duo history` | 打开双方控制面消息历史 | 否 | 否 |
+| `/duo workbench` | 打开双栏实时工作现场 | 否 | 否 |
+| `/duo view` | 隐藏/重新显示双栏工作现场 | 否 | 否 |
+| `/duo goal [目标]` | 查看或修改共享目标 | 否 | 否 |
+| `/duo config ...` | 查看或修改配置 | 否 | 否 |
+
+不存在 `/duo reset`、`/duo clean` 或 `/duo help` 命令。
 
 ### 查看状态
 
@@ -224,13 +247,13 @@ Workspace write owner: Austin
 /duo view
 ```
 
-显示运行状态、当前角色、共享目标、todo 进度、两个模型/session、写入策略、workspace owner、消息总数，以及 Austin → Tony、Tony → Austin 各自通过控制面发送的消息次数和最后活动时间。这里的次数只统计双方实际发给对方的 Duo 消息，不统计模型内部思考或工具调用。
+`/duo` 与 `/duo status` 等价：显示运行状态、当前角色、共享目标、todo 进度、两个模型/session、写入策略、workspace owner、消息总数，以及 Austin → Tony、Tony → Austin 各自通过控制面发送的消息次数和最后活动时间。它们只读取状态，不启动或中止模型。这里的次数只统计双方实际发给对方的 Duo 消息，不统计模型内部思考或工具调用。
 
-`/duo history` 打开当前 Duo 回合的聊天式消息历史：Austin 发出的内容靠左，Tony 发出的内容靠右。按 `ESC` 关闭历史视图并返回 Pi。历史视图与工作现场是**互斥的单个 overlay**（Pi 的 `hideOverlay()` 只能弹出最上层），因此打开历史会先隐藏工作现场，ESC 关闭历史后会自动恢复工作现场。
+`/duo history` 打开当前 Duo 回合的聊天式消息历史：Austin 发出的内容靠左，Tony 发出的内容靠右。此时按 `ESC` 只会关闭历史视图并返回 Pi，**不会停止 Austin 或 Tony**。历史视图与工作现场是**互斥的单个 overlay**（Pi 的 `hideOverlay()` 只能弹出最上层），因此打开历史会先隐藏工作现场，ESC 关闭历史后会自动恢复工作现场。
 
 `/duo workbench` 打开双栏实时"工作现场"视图，`/duo view` 则在显示与隐藏之间切换（toggle）。该视图在**进入 Duo 模式时自动打开**：`/duo start` 成功、以及重新载入已有 active session 时都会自动显示，无需再手动执行命令。
 
-视图形态：**上半屏为双栏原生 transcript**（左栏 Austin、右栏 Tony）。两栏直接复用 Pi 的 assistant、user 与 tool 组件，历史恢复、流式 thinking、工具执行中的状态与工具结果都按普通 Pi 会话显示；`duo_send` 只是 session 中的一条普通消息。**下半屏保持 Austin 的 Pi 输入框、status 与 footer**，输入只发送给 Austin。
+视图形态：**上半屏为双栏原生 transcript**（左栏 Austin、右栏 Tony）。姓名下方固定显示双方的模型、交谈次数和分角色工作状态，避免被动态增高的 Pi 底部 dock 覆盖。两栏直接复用 Pi 的 assistant、user 与 tool 组件，历史恢复、流式 thinking、工具执行中的状态与工具结果都按普通 Pi 会话显示；`duo_send` 只是 session 中的一条普通消息。**下半屏保持 Austin 的 Pi 输入框、status 与 footer**，输入只发送给 Austin。
 
 关键性质与限制：
 
@@ -251,8 +274,9 @@ Workspace write owner: Austin
 - 当前前台模型成为 Austin，并自动覆盖 `config.json` 中旧的 `agentA`；
 - `--peer` 指定 Tony 模型；省略时使用 `config.json` 的 `agentB`，仍未配置则弹出模型选择器；
 - `--goal` 设置初始共享目标；
+- 命令完成后只建立双方 session 和工作现场，不会自动执行新任务；下一条普通用户输入才会启动协作。
 
-> **注意**：`/duo start` 创建新的共享 Duo 状态。已有会话应优先使用 `/duo resume`，避免重新初始化 goal、todo 和 decisions。
+> **注意**：`/duo start` 创建新的共享 Duo 状态，不是恢复命令。已有会话应优先使用 `/duo resume`，避免重新初始化 goal、todo 和 decisions。
 
 ### 暂停
 
@@ -266,13 +290,42 @@ Workspace write owner: Austin
 
 三种停止方式都会保留 Austin/Tony session 和全部 `.pi-duo` 状态。
 
+Pi 默认的 `ESC` 是“取消或中止”键。Austin 正在前台生成时，按一次 `ESC` 即可请求中止当前 Austin 回合，不需要按两次；它不退出 Duo，也不会连带停止正在后台运行的 Tony。为了明确指定对象，推荐使用：
+
+```text
+/duo stop austin   # 只停 Austin 当前回合
+/duo stop tony     # 只停 Tony
+/duo stop          # 双方都停，并暂停整个 Duo
+```
+
+如果 overlay 正在捕获按键（例如 `/duo history`），第一次 `ESC` 的含义是关闭 overlay，而不是中止 agent；回到输入界面后再使用上面的明确命令。
+
 ### 恢复
 
 ```text
 /duo resume
 ```
 
-恢复已保存的 Austin 前台 session 和 Tony 后台 session。若当前 Pi session 不是原 Austin session，pi-duo 会切换回保存的 session。
+恢复 `.pi-duo/state.json` 中已保存的 Austin 前台 session 和 Tony 后台 session：
+
+1. 如果当前 Pi session 不是已保存的 Austin，pi-duo 会直接切换到准确的 Austin session；
+2. Austin session 载入后，pi-duo 从状态中恢复准确的 Tony session；
+3. 双栏工作现场自动重新打开。
+
+这里没有选择列表是有意的：Duo 状态已经保存了两个 session 的 ID 和文件路径，用户无需再次配对。如果想恢复另一段普通 Pi session，请使用 Pi 原生 `/resume`；如果想把它建立成一组新的 Duo，请在那个 session 中执行 `/duo start`。
+
+正常的 `/duo resume` **不会自动开始新任务，也不会在没有用户提示词时让双方继续闲置工作**。`autoDispatch=true` 只在用户提交一条非命令文本时，才把该任务同时调度给 Tony。唯一例外是：如果崩溃或重载打断了一个 `pending` Tony review，恢复逻辑会把该 review 标为 failed，并自动唤醒 Austin 核对中断状态；这是收尾未完成的旧控制流程，不是创建新任务。
+
+### 崩溃或重启后的推荐恢复步骤
+
+```text
+cd <原工作目录>
+pi
+/duo resume
+/duo status
+```
+
+确认状态中的 Austin/Tony session、模型和消息计数正确后，再输入下一条任务。通常不必先执行 Pi 的 `/resume`：`/duo resume` 会自行切回保存的 Austin。只有 `.pi-duo/state.json` 不存在、损坏，或你只是想打开一个与 Duo 无关的普通 session 时，才使用 `/resume`。
 
 ### 查看或修改目标
 
