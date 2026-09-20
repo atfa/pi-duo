@@ -10,7 +10,7 @@ import {
   type ExtensionUIContext,
   type ModelRegistry,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   applyReviewFinding,
@@ -563,7 +563,7 @@ export default function piDuo(pi: ExtensionAPI) {
           // Static history content needs no cache invalidation.
         },
         handleInput(data: string) {
-          if (data === "\u001b" || data === "\u001b\u001b") {
+          if (matchesKey(data, "escape")) {
             done();
             return true;
           }
