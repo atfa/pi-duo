@@ -453,8 +453,8 @@ export default function piDuo(pi: ExtensionAPI) {
   // on long sessions with large tool results.
   const WORKBENCH_REFRESH_MS = 200;
   const DEFAULT_PANEL_ROWS = 12;
-  // Header + header rule + metadata rule + 3 metadata rows + bottom rule.
-  const MIN_PANEL_ROWS = 7;
+  // Header + rule + notice + 3 metadata rows + rule + bottom rule.
+  const MIN_PANEL_ROWS = 8;
   /**
    * Rows available to the panel: the terminal height minus the space pi needs
    * for the input dock (editor + status + widgets + footer). Falls back to the
@@ -607,6 +607,11 @@ export default function piDuo(pi: ExtensionAPI) {
     workbenchPanel?.updateFooters(
       workbenchFooter("austin"),
       workbenchFooter("tony"),
+    );
+    workbenchPanel?.setNotice(
+      reviewIndicatorPhase === "finalized"
+        ? "✓ pi-duo 协作任务彻底完成"
+        : undefined,
     );
     workbenchRequestRender?.(force);
   };
@@ -869,6 +874,11 @@ export default function piDuo(pi: ExtensionAPI) {
             );
             panel.setMaxRows(panelRows);
             workbenchPanel = panel;
+            panel.setNotice(
+              reviewIndicatorPhase === "finalized"
+                ? "✓ pi-duo 协作任务彻底完成"
+                : undefined,
+            );
             panel.update(
               { label: "Austin", cwd: workbenchCwd, messages: transcriptMessages(austinSessionManager, austinStreaming, austinCapturedMessages), streaming: austinStreaming, tools: austinTools, footer: workbenchFooter("austin") },
               { label: "Tony", cwd: workbenchCwd, messages: transcriptMessages(tony, tonyStreaming, tonyCapturedMessages), streaming: tonyStreaming, tools: tonyTools, footer: workbenchFooter("tony") },
@@ -2570,7 +2580,11 @@ export default function piDuo(pi: ExtensionAPI) {
     } else if (state?.review?.status === "pending") {
       setReviewIndicator("working");
     } else if (state?.review?.status === "reported") {
-      setReviewIndicator("complete");
+      setReviewIndicator(
+        state.finalizedUserTurn === state.collaboration?.userTurn
+          ? "finalized"
+          : "complete",
+      );
     } else if (state?.review?.status === "failed") {
       setReviewIndicator("failed", state.review.error);
     } else {

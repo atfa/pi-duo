@@ -38,7 +38,7 @@ test("DuoTranscript splits columns evenly and draws both separators", () => {
   const rows = transcript.render(101).map(stripTerminalSequences);
   assert.equal(rows[0].indexOf("│"), 50);
   assert.equal(rows[1], "─".repeat(101));
-  assert.equal(rows[5], "─".repeat(101));
+  assert.equal(rows[6], "─".repeat(101));
   assert.equal(rows.at(-1), "─".repeat(101));
 });
 
@@ -71,14 +71,25 @@ test("DuoTranscript keeps short Austin content when Tony grows taller", () => {
   assert.equal(rows[1], "─".repeat(100));
   assert.match(output, /Austin stays visible/);
   assert.match(output, /Tony row 7/);
-  assert.ok(rows.slice(6, 9).every((row) => row.indexOf("│") === 49));
-  assert.equal(rows[5], "─".repeat(100));
-  assert.match(rows[2], /模型  Austin/);
-  assert.match(rows[2], /模型  Tony/);
-  assert.match(rows[4], /Austin 等待任务/);
-  assert.match(rows[4], /Tony 等待任务/);
+  assert.ok(rows.slice(7, 9).every((row) => row.indexOf("│") === 49));
+  assert.equal(rows[6], "─".repeat(100));
+  assert.match(rows[3], /模型  Austin/);
+  assert.match(rows[3], /模型  Tony/);
+  assert.match(rows[5], /Austin 等待任务/);
+  assert.match(rows[5], /Tony 等待任务/);
   assert.equal(rows[0].indexOf("│"), 49);
   assert.equal(rows.at(-1), "─".repeat(100));
+});
+
+test("DuoTranscript keeps a completion notice in fixed chrome", () => {
+  const transcript = new DuoTranscript(tui, process.cwd());
+  transcript.setNotice("✓ pi-duo 协作任务彻底完成");
+  transcript.update(
+    { label: "Austin", cwd: process.cwd(), messages: [] },
+    { label: "Tony", cwd: process.cwd(), messages: [] },
+  );
+  const rows = transcript.render(100).map(stripTerminalSequences);
+  assert.match(rows[2], /协作任务彻底完成/);
 });
 
 test("DuoTranscript marks the active assistant component as streaming", () => {

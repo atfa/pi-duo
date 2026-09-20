@@ -104,9 +104,10 @@ export class DuoTranscript implements Component {
   private readonly columns: EqualColumns;
   private austinFooter: readonly string[] = [];
   private tonyFooter: readonly string[] = [];
+  private notice = "";
   private maxRows = 12;
   private static readonly FOOTER_ROWS = 3;
-  private static readonly FIXED_ROWS = 1 + 1 + 1 + DuoTranscript.FOOTER_ROWS + 1;
+  private static readonly FIXED_ROWS = 1 + 1 + 1 + DuoTranscript.FOOTER_ROWS + 1 + 1;
 
   constructor(private readonly tui: TUI, private readonly cwd: string) {
     const austinDocument = new VStack();
@@ -158,7 +159,8 @@ export class DuoTranscript implements Component {
     // Keep metadata next to the top-anchored header. Pi's bottom dock can grow
     // while tools/widgets update; footer rows placed at the overlay's lower
     // edge were intermittently painted over by that dock.
-    return [header, rule, ...footer, rule, ...body, rule];
+    const notice = new Text(this.notice || " ", 1, 0).render(width)[0] ?? "";
+    return [header, rule, notice, ...footer, rule, ...body, rule];
   }
 
   invalidate(): void {
@@ -188,6 +190,10 @@ export class DuoTranscript implements Component {
   ): void {
     this.austinFooter = austin ?? [];
     this.tonyFooter = tony ?? [];
+  }
+
+  setNotice(notice?: string): void {
+    this.notice = notice ?? "";
   }
 
   private renderSession(document: VStack, transcript: SessionTranscript): void {
