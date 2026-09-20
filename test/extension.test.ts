@@ -1142,6 +1142,7 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     };
 
     const api = {
+      async setModel() { return true; },
       registerTool() {},
       registerCommand(name: string, command: { handler: any }) {
         commands.set(name, command.handler);
@@ -1184,9 +1185,13 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     }
 
     // `/duo start` must leave the panel visible without any extra command.
-    // An explicit peer keeps the handler off the interactive model picker.
-    await handler("start --peer provider-b/model/b", ctx);
+    await handler("start", ctx);
     assert.equal(overlayCalls.length, 1, "starting duo mode opens the workbench");
+    let duoState = await store.readState();
+    let duoConfig = await store.readConfig();
+    assert.equal(duoState?.agents.tony.provider, "provider-a");
+    assert.equal(duoState?.agents.tony.modelId, "model/a");
+    assert.deepEqual(duoConfig.agentA, duoConfig.agentB);
 
     const call = overlayCalls[0];
     assert.equal(call.options.overlay, true, "workbench is mounted as an overlay");
@@ -1207,6 +1212,25 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     // eager render call is needed at open time. What matters is that streaming
     // refreshes are wired to the REAL TUI handed to the factory.
     assert.equal(renderRequests, 0, "no redundant eager render at open time");
+
+    await handler("model --austin provider-b/model/b", ctx);
+    duoState = await store.readState();
+    duoConfig = await store.readConfig();
+    assert.equal(duoState?.agents.austin.provider, "provider-b");
+    assert.equal(duoState?.agents.tony.provider, "provider-a");
+    assert.deepEqual(duoConfig.agentA, { provider: "provider-b", modelId: "model/b" });
+
+    (api as any).__registerTonyTools(
+      { registerTool() {}, on() {} },
+      undefined,
+      { isStreaming: false, setModel: async () => {} },
+    );
+    await handler("model provider-b/model/b", ctx);
+    duoState = await store.readState();
+    duoConfig = await store.readConfig();
+    assert.equal(duoState?.agents.austin.provider, "provider-b");
+    assert.equal(duoState?.agents.tony.provider, "provider-b");
+    assert.deepEqual(duoConfig.agentA, duoConfig.agentB);
 
     // The panel is a live component, not a blocked dialog: it renders rows and
     // never declares an input handler.
@@ -1393,7 +1417,7 @@ test("/duo history does not resurrect a workbench that was already hidden", asyn
     for (const onSessionStart of events.get("session_start") || []) {
       await onSessionStart({}, ctx);
     }
-    await handler("start --peer provider-b/model/b", ctx);
+    await handler("start", ctx);
     assert.equal(overlayOpens, 1, "workbench auto-opens on start");
 
     // Hide it first: the user explicitly closed the workbench, so history must
@@ -1592,7 +1616,7 @@ test("streaming deltas coalesce workbench redraws without delaying the first fra
     for (const onSessionStart of events.get("session_start") || []) {
       await onSessionStart({}, ctx);
     }
-    await commands.get("duo")!("start --peer provider-b/model/b", ctx);
+    await commands.get("duo")!("start", ctx);
 
     // Measure only the streaming burst.
     reads = 0;

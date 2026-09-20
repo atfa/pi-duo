@@ -2793,7 +2793,11 @@ export default function piDuo(pi: ExtensionAPI) {
             "Cannot replace an active Duo while Tony review is pending. Use /duo stop first to explicitly record the interrupted review, then run /duo start.",
             "error",
           );
-        const peerArg = parseFlag(args, "peer");
+        if (parseFlag(args, "peer"))
+          return void ctx.ui.notify(
+            "--peer was removed. /duo start uses the current model for both agents; use /duo model after starting to split them.",
+            "error",
+          );
         const goalArg = parseFlag(args, "goal");
         const currentModel = ctx.model;
         if (!currentModel)
@@ -2802,24 +2806,7 @@ export default function piDuo(pi: ExtensionAPI) {
           provider: currentModel.provider,
           modelId: currentModel.id,
         };
-        let peerRef = peerArg ? parseModelRef(peerArg) : config.agentB;
-        if (!peerRef && ctx.hasUI) {
-          const choices = ctx.modelRegistry
-            .getAvailable()
-            .map((m) => `${m.provider}/${m.id}`);
-          const selected = await ctx.ui.select("Select Tony's model", choices);
-          if (selected) peerRef = parseModelRef(selected);
-        }
-        if (!peerRef)
-          return void ctx.ui.notify(
-            "Set agentB in .pi-duo/config.json or use /duo start --peer provider/model",
-            "error",
-          );
-        if (!ctx.modelRegistry.find(peerRef.provider, peerRef.modelId))
-          return void ctx.ui.notify(
-            `Unavailable model: ${modelText(peerRef)}`,
-            "error",
-          );
+        const peerRef = austinRef;
         config.agentA = austinRef;
         config.agentB = peerRef;
         await currentStore.writeConfig(config);
@@ -2995,6 +2982,114 @@ export default function piDuo(pi: ExtensionAPI) {
         foregroundDuoActive = true;
         await openWorkbench(ctx, { silent: true });
         ctx.ui.notify("Duo resumed", "info");
+      } else if (command === "model") {
+        if (state.status !== "active")
+          return void ctx.ui.notify(
+            "Duo is stopped. Use /duo resume before switching active models.",
+            "warning",
+          );
+        const tokens = args.slice("model".length).trim().split(/\s+/).filter(Boolean);
+        let targets: AgentId[] = ["austin", "tony"];
+        if (tokens[0] === "--austin") targets = ["austin"];
+        else if (tokens[0] === "--tony") targets = ["tony"];
+        const value = targets.length === 1 ? tokens[1] : tokens[0];
+        if (!value || tokens.length !== (targets.length === 1 ? 2 : 1))
+          return void ctx.ui.notify(
+            "Usage: /duo model [--austin|--tony] provider/model",
+            "error",
+          );
+        let ref: ModelRef;
+        try {
+          ref = parseModelRef(value);
+        } catch (error) {
+          return void ctx.ui.notify(
+            error instanceof Error ? error.message : String(error),
+            "error",
+          );
+        }
+        const model = ctx.modelRegistry.find(ref.provider, ref.modelId);
+        if (!model)
+          return void ctx.ui.notify(`Unavailable model: ${modelText(ref)}`, "error");
+        if (targets.includes("austin") && !ctx.isIdle())
+          return void ctx.ui.notify(
+            "Austin is working. Stop or wait for the current turn before switching models.",
+            "warning",
+          );
+        if (targets.includes("tony") && (!tony || tony.isStreaming))
+          return void ctx.ui.notify(
+            tony
+              ? "Tony is working. Stop or wait for the current turn before switching models."
+              : "Tony is not running. Use /duo resume before switching his active model.",
+            "warning",
+          );
+
+        const oldAustin = stateModel(state, "austin");
+        const oldTony = stateModel(state, "tony");
+        const oldConfig = { ...config };
+        let changedAustin = false;
+        let changedTony = false;
+        try {
+          if (targets.includes("tony")) {
+            await tony!.setModel(model);
+            changedTony = true;
+          }
+          if (targets.includes("austin")) {
+            if (!(await pi.setModel(model)))
+              throw new Error(`No authentication configured for ${modelText(ref)}`);
+            changedAustin = true;
+          }
+
+          const nextConfig = { ...config };
+          if (targets.includes("austin")) nextConfig.agentA = ref;
+          if (targets.includes("tony")) nextConfig.agentB = ref;
+          await currentStore.update((draft) => {
+            for (const target of targets) {
+              draft.agents[target].provider = ref.provider;
+              draft.agents[target].modelId = ref.modelId;
+            }
+          });
+          await currentStore.writeConfig(nextConfig);
+          config = nextConfig;
+          refreshWorkbench();
+          ctx.ui.notify(
+            `Model updated: ${targets.map(agentName).join(" + ")} → ${modelText(ref)}`,
+            "info",
+          );
+        } catch (error) {
+          try {
+            if (changedAustin && oldAustin) {
+              const previous = ctx.modelRegistry.find(oldAustin.provider, oldAustin.modelId);
+              if (previous) await pi.setModel(previous);
+            }
+            if (changedTony && oldTony) {
+              const previous = ctx.modelRegistry.find(oldTony.provider, oldTony.modelId);
+              if (previous) await tony?.setModel(previous);
+            }
+          } catch {
+            // Continue with durable rollback below.
+          }
+          try {
+            await currentStore.update((draft) => {
+              if (oldAustin) {
+                draft.agents.austin.provider = oldAustin.provider;
+                draft.agents.austin.modelId = oldAustin.modelId;
+              }
+              if (oldTony) {
+                draft.agents.tony.provider = oldTony.provider;
+                draft.agents.tony.modelId = oldTony.modelId;
+              }
+            });
+            await currentStore.writeConfig(oldConfig);
+            config = oldConfig;
+          } catch {
+            // Session history still records model selection; a later model
+            // selection or resume can repair an exceptional filesystem error.
+          }
+          ctx.ui.notify(
+            `Model switch failed: ${error instanceof Error ? error.message : String(error)}`,
+            "error",
+          );
+        }
       } else if (command === "goal") {
         const goal = args.slice("goal".length).trim();
         if (goal) {
@@ -3048,7 +3143,7 @@ export default function piDuo(pi: ExtensionAPI) {
         ctx.ui.notify(renderStatus(state, config, "austin"), "info");
       } else {
         ctx.ui.notify(
-          "Usage: /duo [start|stop|resume|history|view|workbench|status|goal|config]",
+          "Usage: /duo [start|stop|resume|model|history|view|workbench|status|goal|config]",
           "warning",
         );
       }

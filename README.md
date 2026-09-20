@@ -158,28 +158,20 @@ pi
 
 `.pi-duo/` 可能包含 session 历史、模型输出和项目上下文，不建议提交。
 
-### 2. 选择 Austin 的模型
+### 2. 选择初始模型
 
-Austin 就是当前前台 Pi。先用 Pi 的模型选择功能选好 Austin 的模型。执行 `/duo start` 时，当前模型会写入 `config.json` 的 `agentA`；旧配置不会阻止切换模型。
+先用 Pi 的模型选择功能选好初始模型。执行 `/duo start` 时，当前模型会同时用于 Austin 和 Tony，并写入 `config.json` 的 `agentA` / `agentB`；旧配置不会阻止切换模型。
 
 ### 3. 启动 Duo
-
-交互选择 Tony 模型：
 
 ```text
 /duo start --goal "修复支付回调的并发重复入账问题"
 ```
 
-或直接指定：
+启动后如需使用不同模型，通过 `/duo model` 调整：
 
 ```text
-/duo start --peer anthropic/claude-sonnet-4-5 --goal "修复支付回调的并发重复入账问题"
-```
-
-`provider/model` 中 model 部分可以继续包含 `/`，例如：
-
-```text
-/duo start --peer openrouter/anthropic/claude-sonnet-4.5
+/duo model --tony openrouter/anthropic/claude-sonnet-4.5
 ```
 
 ### 4. 确认状态
@@ -230,6 +222,7 @@ Pi 原生 `/resume` 与 `/duo resume` 解决的是两件不同的事：
 | `/duo`、`/duo status` | 显示当前 Duo 状态 | 否 | 否 |
 | `/duo start ...` | 新建 Duo，并把当前 session 设为 Austin | 会替换可安全重建的旧状态 | 否，等待用户输入任务 |
 | `/duo resume` | 恢复状态中固定的 Austin/Tony session | 否 | 通常否；仅处理中断中的 review 或最终收口，见下文 |
+| `/duo model [--austin\|--tony] provider/model` | 切换一方或双方模型并持久化 | 否 | 否；双方必须处于空闲状态 |
 | `/duo stop` | 停止 Austin、Tony 和整个 Duo | 是，双方 | 否 |
 | `/duo stop austin` | 只停止 Austin 当前回合 | 是，仅 Austin | 否 |
 | `/duo stop tony` | 只停止 Tony，Duo 降级运行 | 是，仅 Tony | 会通知正在运行的 Austin 已降级 |
@@ -272,16 +265,28 @@ Pi 原生 `/resume` 与 `/duo resume` 解决的是两件不同的事：
 
 ```text
 /duo start
-/duo start --peer provider/model
 /duo start --goal "目标"
-/duo start --peer provider/model --goal "目标"
 ```
 
 - 当前 Pi session 成为 Austin；
-- 当前前台模型成为 Austin，并自动覆盖 `config.json` 中旧的 `agentA`；
-- `--peer` 指定 Tony 模型；省略时使用 `config.json` 的 `agentB`，仍未配置则弹出模型选择器；
+- 当前前台模型同时成为 Austin 与 Tony 的初始模型，并覆盖 `config.json` 中旧的 `agentA` / `agentB`；
 - `--goal` 设置初始共享目标；
 - 命令完成后只建立双方 session 和工作现场，不会自动执行新任务；下一条普通用户输入才会启动协作。
+
+`--peer` 已移除。需要分开模型时，在启动完成后使用：
+
+```text
+/duo model --austin llama/exec
+/duo model --tony llama/think
+```
+
+省略角色参数会同时切换双方：
+
+```text
+/duo model llama/exec
+```
+
+模型切换会同步更新两个活跃 session、`.pi-duo/config.json` 与 `.pi-duo/state.json`。为避免正在生成的请求跨模型，目标 Agent 工作中时命令会拒绝执行；等待其空闲或先用 `/duo stop austin|tony` 中止当前回合。`provider/model` 的 model 部分可以继续包含 `/`。
 
 > **注意**：`/duo start` 创建新的共享 Duo 状态，不是恢复命令。已有会话应优先使用 `/duo resume`，避免重新初始化 goal、todo 和 decisions。
 
@@ -391,8 +396,8 @@ pi
 
 | 配置项 | 默认值 | `/duo config` | 说明 |
 | --- | --- | --- | --- |
-| `agentA` | 启动时记录 | 否 | Austin 的 `{provider, modelId}`；每次 `/duo start` 都以当前前台模型自动更新。 |
-| `agentB` | 交互选择或 `--peer` | 否 | Tony 的 `{provider, modelId}`。 |
+| `agentA` | 启动时记录 | 否 | Austin 的 `{provider, modelId}`；由 `/duo start` 或 `/duo model` 更新。 |
+| `agentB` | 启动时记录 | 否 | Tony 的 `{provider, modelId}`；初始与 Austin 相同，可由 `/duo model` 分开。 |
 | `autoDispatch` | `true` | 是 | `true`：每个普通用户任务自动派发给 Tony；`false`：只在 Austin 显式调用 `duo_send` 时联系 Tony。 |
 | `writePolicy` | `"austin-only"` | 是 | `austin-only` 或 `transferable`，详见下文。 |
 | `maxPeerMessagesPerTurn` | `6` | 是 | 每个用户回合最多触发多少条 peer 消息，最小值为 `4`，避免审查、修复和复验闭环因配置而死锁。最后一个触发槽保留给 `important`/`decision`。 |
@@ -605,9 +610,9 @@ Austin 的原生 session 仍保存在 Pi 的正常 session 目录中；`state.js
 2. 当前 Pi 中运行 `/reload`，或重启 Pi；
 3. 本地开发模式下检查 `~/.pi/agent/extensions/pi-duo` 链接。
 
-### `/duo start` 提示 Austin 模型不匹配
+### 模型切换被拒绝
 
-`config.json` 已保存 `agentA`。请在 Pi 中选回该模型，或在确认要新建 Duo 后修改配置并重新开始。
+`/duo model` 只在目标 Agent 空闲时切换。等待当前回合完成，或先用 `/duo stop austin`、`/duo stop tony` 中止对应回合；模型不可用时先确认 provider 凭证和模型 ID。
 
 ### Tony 模型 unavailable / provider error
 
