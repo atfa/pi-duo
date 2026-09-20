@@ -98,6 +98,8 @@ export interface DuoState {
   workspaceOwner: AgentId | null;
   collaboration?: DuoCollaborationState;
   review?: DuoReviewState;
+  /** User turn whose final Austin response and completion notice both finished. */
+  finalizedUserTurn?: number;
   peerMessageCount: number;
   /** Durable counts of messages sent across the Austin ↔ Tony control plane. */
   austinPeerMessageCount: number;

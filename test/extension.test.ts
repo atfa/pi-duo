@@ -249,11 +249,30 @@ test("duo_plan and duo_checkpoint enforce strict phase transitions", async () =>
     assert.match(completeOk.content[0].text, /Collaboration marked complete/i);
     state = await store.readState();
     assert.equal(state?.collaboration?.phase, "complete");
+    await store.update((draft) => {
+      draft.todo.push({
+        id: 1,
+        text: "final reconciliation",
+        status: "pending",
+        owner: "austin",
+        updatedAt: new Date().toISOString(),
+      });
+    });
     assert.equal(
       notices.filter((message) => /彻底完成/.test(message)).length,
       0,
       "verification completion must not notify before Austin's final turn ends",
     );
+    for (const handler of events.get("agent_end") || []) await handler();
+    assert.equal(
+      notices.filter((message) => /彻底完成/.test(message)).length,
+      0,
+      "open todos trigger reconciliation instead of completion",
+    );
+    await store.update((draft) => {
+      draft.todo[0].status = "done";
+      draft.todo[0].updatedAt = new Date().toISOString();
+    });
     for (const handler of events.get("agent_end") || []) await handler();
     for (const handler of events.get("agent_end") || []) await handler();
     assert.equal(
@@ -261,6 +280,8 @@ test("duo_plan and duo_checkpoint enforce strict phase transitions", async () =>
       1,
       "the final completion notification is emitted once",
     );
+    state = await store.readState();
+    assert.equal(state?.finalizedUserTurn, 1, "final completion is durable");
 
     // 8. Reopen returns to EXECUTE and clears review
     const reopenOk = await checkpointExecute("7", { action: "reopen" });
@@ -1459,6 +1480,23 @@ test("automatic workbench opening stays silent in a non-TUI host", async () => {
       "automatic open must not report a TUI-mode error",
     );
 
+    await handler("status", {
+      cwd,
+      mode: "rpc",
+      ui,
+      isIdle: () => true,
+      abort: () => {},
+      sessionManager: {
+        getSessionId: () => "mock-session-id",
+        getSessionFile: () => undefined,
+      },
+      modelRegistry: { find: () => undefined, getAvailable: () => [] },
+    });
+    assert.ok(
+      notices.some((n) => /^Duo: active/.test(n.message)),
+      "/duo status must remain visible above the workbench overlay",
+    );
+
     // An explicit request, by contrast, is allowed to explain the limitation.
     await handler("workbench", {
       cwd,
@@ -1588,7 +1626,7 @@ test("streaming deltas coalesce workbench redraws without delaying the first fra
 
     // One trailing repaint catches the final delta without rebuilding the
     // entire native component tree once per token.
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await new Promise((resolve) => setTimeout(resolve, 250));
     assert.equal(renderRequests, 2, "the final delta gets one trailing render");
 
     // Each update is a distinct assistant object. It must replace the one
@@ -1613,7 +1651,7 @@ test("streaming deltas coalesce workbench redraws without delaying the first fra
     for (const onEnd of events.get("message_end") || []) {
       onEnd({ message: finished });
     }
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await new Promise((resolve) => setTimeout(resolve, 250));
     const transcript = (panel as any).austinDocument.render(59).join("\n");
     assert.equal((transcript.match(/stream finished/g) || []).length, 1);
 
@@ -1626,7 +1664,7 @@ test("streaming deltas coalesce workbench redraws without delaying the first fra
     for (const onEnd of events.get("message_end") || []) {
       onEnd({ message: { role: "user", content: userText } });
     }
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await new Promise((resolve) => setTimeout(resolve, 250));
     const userTranscript = (panel as any).austinDocument.render(59).join("\n");
     assert.equal((userTranscript.match(/same user turn/g) || []).length, 1);
 

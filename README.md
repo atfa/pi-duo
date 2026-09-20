@@ -217,6 +217,8 @@ Pi 原生 `/resume` 与 `/duo resume` 解决的是两件不同的事：
 - `/resume` 从 Pi 保存的 session 中选择并恢复**一个前台 session**。它不知道 Austin/Tony 的配对关系，也不会单独恢复 Tony。
 - `/duo resume` 恢复当前工作目录 `.pi-duo/state.json` 中记录的**一整对 Austin/Tony session**。每个工作目录当前只有一份 Duo 状态，因此它没有、也不需要 session 选择列表。
 
+`.pi-duo` 严格按当前工作目录隔离。父目录和子目录各自存在 `.pi-duo` 时，它们是两组不同的 Duo；请先 `cd` 到创建任务时的目录再执行 `pi` 和 `/duo resume`，否则看到的模型与 session 会属于另一组工作区。
+
 不带 agent 名称的 `/duo stop` 会完整退出 Duo 模式、中止双方当前回合并清除状态提示。`/duo stop austin` 和 `/duo stop tony` 只是定向中止其中一方，不退出整个 Duo 模式。
 
 ### 命令速查
@@ -225,7 +227,7 @@ Pi 原生 `/resume` 与 `/duo resume` 解决的是两件不同的事：
 |---|---|---|---|
 | `/duo`、`/duo status` | 显示当前 Duo 状态 | 否 | 否 |
 | `/duo start ...` | 新建 Duo，并把当前 session 设为 Austin | 会替换可安全重建的旧状态 | 否，等待用户输入任务 |
-| `/duo resume` | 恢复状态中固定的 Austin/Tony session | 否 | 通常否；仅处理中断中的 review，见下文 |
+| `/duo resume` | 恢复状态中固定的 Austin/Tony session | 否 | 通常否；仅处理中断中的 review 或最终收口，见下文 |
 | `/duo stop` | 停止 Austin、Tony 和整个 Duo | 是，双方 | 否 |
 | `/duo stop austin` | 只停止 Austin 当前回合 | 是，仅 Austin | 否 |
 | `/duo stop tony` | 只停止 Tony，Duo 降级运行 | 是，仅 Tony | 会通知正在运行的 Austin 已降级 |
@@ -314,7 +316,7 @@ Pi 默认的 `ESC` 是“取消或中止”键。Austin 正在前台生成时，
 
 这里没有选择列表是有意的：Duo 状态已经保存了两个 session 的 ID 和文件路径，用户无需再次配对。如果想恢复另一段普通 Pi session，请使用 Pi 原生 `/resume`；如果想把它建立成一组新的 Duo，请在那个 session 中执行 `/duo start`。
 
-正常的 `/duo resume` **不会自动开始新任务，也不会在没有用户提示词时让双方继续闲置工作**。`autoDispatch=true` 只在用户提交一条非命令文本时，才把该任务同时调度给 Tony。唯一例外是：如果崩溃或重载打断了一个 `pending` Tony review，恢复逻辑会把该 review 标为 failed，并自动唤醒 Austin 核对中断状态；这是收尾未完成的旧控制流程，不是创建新任务。
+正常的 `/duo resume` **不会自动开始新任务，也不会在没有用户提示词时让双方继续闲置工作**。`autoDispatch=true` 只在用户提交一条非命令文本时，才把该任务同时调度给 Tony。例外只有未完成的旧控制流程：恢复时若发现被打断的 `pending` Tony review，或 Tony 已验收但 Austin 尚未完成最终回复，pi-duo 会自动唤醒 Austin 收口；不会创建新任务。
 
 ### 崩溃或重启后的推荐恢复步骤
 

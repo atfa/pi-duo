@@ -167,12 +167,18 @@ export class DuoTranscript implements Component {
 
   /** Rebuild from persisted/live message objects; safe for stream updates. */
   update(austin: SessionTranscript, tony: SessionTranscript): void {
-    this.renderSession(this.austinDocument, austin);
-    this.renderSession(this.tonyDocument, tony);
+    this.updateSide("austin", austin);
+    this.updateSide("tony", tony);
     this.updateFooters(austin.footer, tony.footer);
-    this.austinColumn.scrollToEnd();
-    this.tonyColumn.scrollToEnd();
     this.invalidate();
+  }
+
+  /** Rebuild only the agent whose live transcript changed. */
+  updateSide(side: "austin" | "tony", transcript: SessionTranscript): void {
+    const document = side === "austin" ? this.austinDocument : this.tonyDocument;
+    const column = side === "austin" ? this.austinColumn : this.tonyColumn;
+    this.renderSession(document, transcript);
+    column.scrollToEnd();
   }
 
   /** Update animated metadata without rebuilding either transcript tree. */

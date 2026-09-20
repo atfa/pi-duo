@@ -264,6 +264,7 @@ export class DuoStore {
           highWaterMark = Math.max(highWaterMark, message.userTurn);
       }
       state.userTurn = highWaterMark + 1;
+      delete state.finalizedUserTurn;
       state.revision += 1;
       state.updatedAt = now();
       state.lastActivityAt = state.updatedAt;

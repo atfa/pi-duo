@@ -64,7 +64,7 @@ import type {
 } from "./src/types.js";
 import { DuoTranscript, type LiveToolState } from "./src/workbench.js";
 
-const TRANSCRIPT_MESSAGE_LIMIT = 80;
+const TRANSCRIPT_MESSAGE_LIMIT = 40;
 
 /** Cheap display-only identity; never serialize an entire model/tool payload. */
 export function transcriptMessageKey(message: any): string {
@@ -447,7 +447,11 @@ export default function piDuo(pi: ExtensionAPI) {
   // first event responsive, then coalesce the rest into one trailing redraw.
   let workbenchRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let lastWorkbenchRefreshAt = 0;
-  const WORKBENCH_REFRESH_MS = 100;
+  const workbenchDirtySides = new Set<AgentId>();
+  // Rebuilding Pi's native transcript components is expensive. Five frames
+  // per second remains visibly live without retaining multi-gigabyte bursts
+  // on long sessions with large tool results.
+  const WORKBENCH_REFRESH_MS = 200;
   const DEFAULT_PANEL_ROWS = 12;
   // Header + header rule + metadata rule + 3 metadata rows + bottom rule.
   const MIN_PANEL_ROWS = 7;
@@ -948,16 +952,28 @@ export default function piDuo(pi: ExtensionAPI) {
     await showWorkbench(ctx);
   };
 
-  const refreshWorkbench = (immediate = false) => {
+  const refreshWorkbench = (immediate = false, side?: AgentId) => {
     if (!workbenchPanel || !workbenchRequestRender) return;
+    if (side) workbenchDirtySides.add(side);
+    else {
+      workbenchDirtySides.add("austin");
+      workbenchDirtySides.add("tony");
+    }
     const render = () => {
       workbenchRefreshTimer = undefined;
       if (!workbenchPanel || !workbenchRequestRender) return;
       lastWorkbenchRefreshAt = Date.now();
-      workbenchPanel.update(
-        { label: "Austin", cwd: workbenchCwd, messages: transcriptMessages(austinSessionManager, austinStreaming, austinCapturedMessages), streaming: austinStreaming, tools: austinTools, footer: workbenchFooter("austin") },
-        { label: "Tony", cwd: workbenchCwd, messages: transcriptMessages(tony, tonyStreaming, tonyCapturedMessages), streaming: tonyStreaming, tools: tonyTools, footer: workbenchFooter("tony") },
-      );
+      const austin = { label: "Austin", cwd: workbenchCwd, messages: transcriptMessages(austinSessionManager, austinStreaming, austinCapturedMessages), streaming: austinStreaming, tools: austinTools, footer: workbenchFooter("austin") };
+      const tonyTranscript = { label: "Tony", cwd: workbenchCwd, messages: transcriptMessages(tony, tonyStreaming, tonyCapturedMessages), streaming: tonyStreaming, tools: tonyTools, footer: workbenchFooter("tony") };
+      for (const dirtySide of workbenchDirtySides) {
+        workbenchPanel.updateSide(
+          dirtySide,
+          dirtySide === "austin" ? austin : tonyTranscript,
+        );
+      }
+      workbenchDirtySides.clear();
+      workbenchPanel.updateFooters(austin.footer, tonyTranscript.footer);
+      workbenchPanel.invalidate();
       workbenchRequestRender();
     };
     if (immediate) {
@@ -2041,13 +2057,13 @@ export default function piDuo(pi: ExtensionAPI) {
         if (actor === "austin") austinStreaming = event.message;
         else tonyStreaming = event.message;
       }
-      refreshWorkbench(true);
+      refreshWorkbench(true, actor);
     });
     api.on("message_update", (event) => {
       if (event.message?.role !== "assistant") return;
       if (actor === "austin") austinStreaming = event.message;
       else tonyStreaming = event.message;
-      refreshWorkbench();
+      refreshWorkbench(false, actor);
     });
     api.on("message_end", (event) => {
       const streaming = event.message?.role === "assistant"
@@ -2063,7 +2079,7 @@ export default function piDuo(pi: ExtensionAPI) {
       }
       // Tool results are persisted after their execution event; this redraw
       // makes the native component converge even when that happens later.
-      refreshWorkbench();
+      refreshWorkbench(false, actor);
     });
     api.on("tool_execution_start", (event) => {
       tools.set(event.toolCallId, {
@@ -2072,7 +2088,7 @@ export default function piDuo(pi: ExtensionAPI) {
         args: event.args,
         started: true,
       });
-      refreshWorkbench();
+      refreshWorkbench(false, actor);
     });
     api.on("tool_execution_update", (event) => {
       tools.set(event.toolCallId, {
@@ -2081,7 +2097,7 @@ export default function piDuo(pi: ExtensionAPI) {
         args: event.args,
         partial: result(event.partialResult, false),
       });
-      refreshWorkbench();
+      refreshWorkbench(false, actor);
     });
     api.on("tool_execution_end", (event) => {
       tools.set(event.toolCallId, {
@@ -2090,7 +2106,7 @@ export default function piDuo(pi: ExtensionAPI) {
         args: tools.get(event.toolCallId)?.args,
         final: result(event.result, event.isError),
       });
-      refreshWorkbench();
+      refreshWorkbench(false, actor);
     });
   };
 
@@ -2500,6 +2516,12 @@ export default function piDuo(pi: ExtensionAPI) {
     const isAustinSession =
       state?.status === "active" &&
       state.agents.austin.sessionId === ctx.sessionManager.getSessionId();
+    const needsFinalization = Boolean(
+      isAustinSession &&
+      state?.collaboration?.phase === "complete" &&
+      state.review?.status === "reported" &&
+      state.finalizedUserTurn !== state.collaboration.userTurn
+    );
     foregroundDuoActive = isAustinSession;
     let interruptedReview = false;
     if (isAustinSession && state?.review?.status === "pending") {
@@ -2562,6 +2584,21 @@ export default function piDuo(pi: ExtensionAPI) {
       // Automatic: resuming an active duo in a non-TUI host must not emit an
       // unsolicited "requires TUI mode" error.
       await openWorkbench(ctx, { silent: true });
+      if (needsFinalization) {
+        ctx.ui.notify(
+          "pi-duo: Tony 已验收，正在恢复 Austin 被中断的最终收口。",
+          "info",
+        );
+        sendMessageSafely(
+          {
+            customType: "pi-duo-completion-gate",
+            content:
+              "The previous process stopped after Tony reported verification but before the final Austin response was durably completed. Reconcile the current shared todos, summarize the verified result for the user, and do not start unrelated work.",
+            display: true,
+          },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+      }
     } else {
       closeWorkbench();
     }
@@ -2605,18 +2642,25 @@ export default function piDuo(pi: ExtensionAPI) {
     if (
       !state ||
       state.status !== "active" ||
-      state.review?.status === "pending" ||
-      completionReconcileTurn === guard.turn
+      state.review?.status === "pending"
     )
       return;
     const ids = openCompletionTodoIds(state);
     if (!ids.length) {
-      const completionTurn = state.userTurn ?? guard.turn;
+      const completionTurn =
+        state.collaboration?.userTurn ?? state.userTurn ?? guard.turn;
       if (
         state.collaboration?.phase === "complete" &&
         state.review?.status === "reported" &&
         completionNotifiedTurn !== completionTurn
       ) {
+        await store.update((draft) => {
+          if (
+            draft.collaboration?.phase === "complete" &&
+            draft.review?.status === "reported" &&
+            draft.collaboration.userTurn === completionTurn
+          ) draft.finalizedUserTurn = completionTurn;
+        });
         completionNotifiedTurn = completionTurn;
         setReviewIndicator("finalized");
         foregroundUI?.notify(
@@ -2626,6 +2670,7 @@ export default function piDuo(pi: ExtensionAPI) {
       }
       return;
     }
+    if (completionReconcileTurn === guard.turn) return;
     completionReconcileTurn = guard.turn;
     sendMessageSafely(
       {
@@ -2650,6 +2695,7 @@ export default function piDuo(pi: ExtensionAPI) {
     );
     if (foregroundDuoActive && state?.status === "active" && config.autoDispatch) {
       await currentStore.update((draft) => {
+        delete draft.finalizedUserTurn;
         draft.collaboration = {
           userTurn,
           phase: "explore",
@@ -2942,12 +2988,7 @@ export default function piDuo(pi: ExtensionAPI) {
             draft.goal = goal;
           });
           ctx.ui.notify(`Goal updated (revision ${updated.revision})`, "info");
-        } else
-          pi.sendMessage({
-            customType: "pi-duo-peer",
-            content: `GOAL\n${state.goal || "(not set)"}`,
-            display: true,
-          });
+        } else ctx.ui.notify(`GOAL\n${state.goal || "(not set)"}`, "info");
       } else if (command === "config") {
         const updates = args
           .slice("config".length)
@@ -2988,17 +3029,9 @@ export default function piDuo(pi: ExtensionAPI) {
         await currentStore.writeConfig(config);
         config = await currentStore.readConfig();
         await enforceWritePolicy(currentStore, config);
-        pi.sendMessage({
-          customType: "pi-duo-peer",
-          content: JSON.stringify(config, null, 2),
-          display: true,
-        });
+        ctx.ui.notify(JSON.stringify(config, null, 2), "info");
       } else if (command === "status" || command === "") {
-        pi.sendMessage({
-          customType: "pi-duo-peer",
-          content: renderStatus(state, config, "austin"),
-          display: true,
-        });
+        ctx.ui.notify(renderStatus(state, config, "austin"), "info");
       } else {
         ctx.ui.notify(
           "Usage: /duo [start|stop|resume|history|view|workbench|status|goal|config]",
