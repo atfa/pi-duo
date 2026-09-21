@@ -28,6 +28,7 @@ export interface ModelRef {
 export interface DuoConfig {
   agentA?: ModelRef;
   agentB?: ModelRef;
+  tonyExtensions: string[];
   maxPeerMessagesPerTurn: number;
   maxDeferredMessagesPerTurn: number;
   maxConsecutivePeerTurns: number;

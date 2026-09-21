@@ -7,10 +7,12 @@ import {
   DEFAULT_CONFIG,
   DuoStore,
   formatSharedContext,
+  isTonyExtensionPackage,
   isMutatingShell,
   isWaitingShell,
   MIN_PEER_MESSAGES_PER_TURN,
   parseModelRef,
+  resolveTonyExtensionPaths,
   textSimilarity,
 } from "../src/store.js";
 
@@ -32,6 +34,16 @@ test("parses provider/model while preserving slashes in model id", () => {
   assert.throws(() => parseModelRef("missing-slash"));
 });
 
+test("Tony extension whitelist accepts npm names and resolves only those packages", () => {
+  assert.equal(isTonyExtensionPackage("pi-lens"), true);
+  assert.equal(isTonyExtensionPackage("@scope/pi-lens"), true);
+  assert.equal(isTonyExtensionPackage("../unsafe"), false);
+  assert.deepEqual(
+    resolveTonyExtensionPaths("/agent", ["pi-web-access", "../unsafe"]),
+    [path.join("/agent", "npm", "node_modules", "pi-web-access")],
+  );
+});
+
 test("persists config defaults and overrides", async () => {
   const { cwd, store } = await fixture();
   try {
@@ -46,6 +58,7 @@ test("persists config defaults and overrides", async () => {
     assert.equal(config.autoDispatch, false);
     assert.equal(config.writePolicy, "transferable");
     assert.deepEqual(config.agentB, { provider: "x", modelId: "y" });
+    assert.deepEqual(config.tonyExtensions, ["pi-web-access", "pi-lens"]);
 
     await writeFile(store.configPath, '{"autoDispatch":false}\n');
     const migrated = await store.readConfig();
@@ -53,6 +66,11 @@ test("persists config defaults and overrides", async () => {
     assert.equal(migrated.maxDeferredMessagesPerTurn, 2);
     await writeFile(store.configPath, '{"writePolicy":"invalid"}\n');
     assert.equal((await store.readConfig()).writePolicy, "austin-only");
+    await writeFile(
+      store.configPath,
+      '{"tonyExtensions":[" pi-lens ","pi-lens","../unsafe"]}\n',
+    );
+    assert.deepEqual((await store.readConfig()).tonyExtensions, ["pi-lens"]);
     await writeFile(
       store.configPath,
       '{"maxPeerMessagesPerTurn":1,"maxConsecutivePeerTurns":0,"similarityThreshold":2}\n',

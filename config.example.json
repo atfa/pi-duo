@@ -7,6 +7,7 @@
     "provider": "your-tony-provider",
     "modelId": "your-tony-model"
   },
+  "tonyExtensions": ["pi-web-access", "pi-lens"],
   "maxPeerMessagesPerTurn": 6,
   "maxDeferredMessagesPerTurn": 2,
   "maxConsecutivePeerTurns": 3,

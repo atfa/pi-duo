@@ -1203,11 +1203,9 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     assert.equal(call.options.overlayOptions.row, 0);
     assert.equal(call.options.overlayOptions.col, 0);
     assert.equal(call.options.overlayOptions.width, "100%");
-    // Pi's 30%-of-terminal value is an editor maximum, not its current height.
-    // The normal editor is 3 rows; reserving the maximum exposes the native
-    // Austin transcript beneath the overlay and duplicates the left column.
-    // At 40 rows: editor 3 + footer 3 + transient dock slack 2 = 8.
-    assert.equal(call.options.overlayOptions.maxHeight, 40 - 8);
+    // Pi resolves percentage bounds against the live terminal for every
+    // render; DuoTranscript separately reserves the current dock rows.
+    assert.equal(call.options.overlayOptions.maxHeight, "100%");
     // pi's own `showOverlay` repaints when the overlay is installed, so no
     // eager render call is needed at open time. What matters is that streaming
     // refreshes are wired to the REAL TUI handed to the factory.

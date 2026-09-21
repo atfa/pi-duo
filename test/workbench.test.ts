@@ -81,6 +81,58 @@ test("DuoTranscript keeps short Austin content when Tony grows taller", () => {
   assert.equal(rows.at(-1), "─".repeat(100));
 });
 
+test("DuoTranscript keeps a fixed height for short content without duplicating it", () => {
+  const transcript = new DuoTranscript(tui, process.cwd());
+  transcript.setMaxRows(12);
+  transcript.update(
+    {
+      label: "Austin",
+      cwd: process.cwd(),
+      messages: [{ ...assistant, content: [{ type: "text", text: "Austin appears once" }] }],
+    },
+    { label: "Tony", cwd: process.cwd(), messages: [] },
+  );
+
+  const rows = transcript.render(100).map(stripTerminalSequences);
+  const output = rows.join("\n");
+  assert.equal(rows.length, 12);
+  assert.equal(output.match(/Austin appears once/g)?.length, 1);
+  assert.ok(rows.slice(7, -1).every((row) => row.indexOf("│") === 49));
+  assert.equal(rows.at(-1), "─".repeat(100));
+});
+
+test("DuoTranscript recomputes its height on terminal resize", () => {
+  const terminal = { rows: 20 };
+  const transcript = new DuoTranscript(
+    { requestRender() {}, terminal } as any,
+    process.cwd(),
+    () => terminal.rows - 8,
+  );
+  transcript.update(
+    {
+      label: "Austin",
+      cwd: process.cwd(),
+      messages: [{ ...assistant, content: [{ type: "text", text: "Austin appears once after resize" }] }],
+    },
+    { label: "Tony", cwd: process.cwd(), messages: [] },
+  );
+
+  let rows = transcript.render(100).map(stripTerminalSequences);
+  assert.equal(rows.length, 12);
+  assert.equal(rows.join("\n").match(/Austin appears once after resize/g)?.length, 1);
+
+  terminal.rows = 30;
+  rows = transcript.render(100).map(stripTerminalSequences);
+  assert.equal(rows.length, 22);
+  assert.equal(rows.join("\n").match(/Austin appears once after resize/g)?.length, 1);
+
+  terminal.rows = 18;
+  rows = transcript.render(100).map(stripTerminalSequences);
+  assert.equal(rows.length, 10);
+  assert.equal(rows.join("\n").match(/Austin appears once after resize/g)?.length, 1);
+  assert.ok(rows.slice(7, -1).every((row) => row.indexOf("│") === 49));
+});
+
 test("DuoTranscript keeps a completion notice in fixed chrome", () => {
   const transcript = new DuoTranscript(tui, process.cwd());
   transcript.setNotice("✓ pi-duo 协作任务彻底完成");

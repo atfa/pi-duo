@@ -50,6 +50,8 @@ import {
   MIN_PEER_MESSAGES_PER_TURN,
   otherAgent,
   parseModelRef,
+  isTonyExtensionPackage,
+  resolveTonyExtensionPaths,
 } from "./src/store.js";
 import type {
   AgentId,
@@ -860,19 +862,17 @@ export default function piDuo(pi: ExtensionAPI) {
     // delivered asynchronously: `done` inside the factory, `onHandle` after the
     // factory resolves. Record them so `closeWorkbench` can tear down safely.
     let settled = false;
-    let panelRows = DEFAULT_PANEL_ROWS;
     try {
       void ui
         .custom<void>(
           (tui, _theme, _keybindings, done) => {
             // Row budget comes from the real TUI, which is only reachable here.
             // `ctx.ui` exposes no terminal metrics in pi 0.86.
-            const panel = new DuoTranscript(tui, ctx?.cwd ?? process.cwd());
-            panelRows = panelRowBudget(
-              tui as OverlayHost,
-              workbenchEditorReserve((tui as OverlayHost).terminal?.rows ?? DEFAULT_PANEL_ROWS),
-            );
-            panel.setMaxRows(panelRows);
+            const host = tui as OverlayHost;
+            const panel = new DuoTranscript(tui, ctx?.cwd ?? process.cwd(), () => panelRowBudget(
+              host,
+              workbenchEditorReserve(host.terminal?.rows ?? DEFAULT_PANEL_ROWS),
+            ));
             workbenchPanel = panel;
             panel.setNotice(
               reviewIndicatorPhase === "finalized"
@@ -895,10 +895,6 @@ export default function piDuo(pi: ExtensionAPI) {
           },
           {
             overlay: true,
-            // A function, not a literal: pi resolves these *after* the factory
-            // has run, so `panel.rowBudget` already reflects the real terminal
-            // height applied by `setMaxRows` inside the factory. Reading it
-            // eagerly here would capture the constructor's default instead.
             overlayOptions: () => ({
               // Fill the width and anchor at the very top so the panel occupies
               // the upper display region rather than floating as a centred
@@ -907,7 +903,9 @@ export default function piDuo(pi: ExtensionAPI) {
               row: 0,
               col: 0,
               width: "100%",
-              maxHeight: panelRows,
+              // Pi resolves percentage bounds against the current terminal on
+              // every render. The transcript itself reserves the live dock.
+              maxHeight: "100%",
               nonCapturing: true,
             }),
             onHandle: (handle) => {
@@ -2158,6 +2156,10 @@ export default function piDuo(pi: ExtensionAPI) {
       cwd,
       agentDir: getAgentDir(),
       noExtensions: true,
+      additionalExtensionPaths: resolveTonyExtensionPaths(
+        getAgentDir(),
+        config.tonyExtensions,
+      ),
       extensionFactories: [
         { name: "pi-duo-tony", factory: duoFactory, hidden: true },
       ],
@@ -3133,6 +3135,14 @@ export default function piDuo(pi: ExtensionAPI) {
                 "error",
               );
             config.writePolicy = value;
+          } else if (key === "tonyExtensions") {
+            const names = value === "none" ? [] : (value ?? "").split(",");
+            if (names.some((name) => !isTonyExtensionPackage(name.trim())))
+              return void ctx.ui.notify(
+                "tonyExtensions must be comma-separated npm package names, or none",
+                "error",
+              );
+            config.tonyExtensions = names.map((name) => name.trim());
           } else return void ctx.ui.notify(`Unknown config key: ${key}`, "error");
         }
         await currentStore.writeConfig(config);

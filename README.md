@@ -359,6 +359,7 @@ pi
 ```text
 /duo config autoDispatch=false
 /duo config writePolicy=transferable
+/duo config tonyExtensions=pi-web-access,pi-lens
 /duo config maxPeerMessagesPerTurn=4 maxDeferredMessagesPerTurn=2
 /duo config maxConsecutivePeerTurns=2 similarityThreshold=0.92
 ```
@@ -385,6 +386,7 @@ pi
     "provider": "your-tony-provider",
     "modelId": "your-tony-model"
   },
+  "tonyExtensions": ["pi-web-access", "pi-lens"],
   "maxPeerMessagesPerTurn": 6,
   "maxDeferredMessagesPerTurn": 2,
   "maxConsecutivePeerTurns": 3,
@@ -398,6 +400,7 @@ pi
 | --- | --- | --- | --- |
 | `agentA` | 启动时记录 | 否 | Austin 的 `{provider, modelId}`；由 `/duo start` 或 `/duo model` 更新。 |
 | `agentB` | 启动时记录 | 否 | Tony 的 `{provider, modelId}`；初始与 Austin 相同，可由 `/duo model` 分开。 |
+| `tonyExtensions` | `["pi-web-access", "pi-lens"]` | 是 | Tony 专用扩展白名单。只接受已安装的 npm 包名；不会继承 Austin 的其他扩展。 |
 | `autoDispatch` | `true` | 是 | `true`：每个普通用户任务自动派发给 Tony；`false`：只在 Austin 显式调用 `duo_send` 时联系 Tony。 |
 | `writePolicy` | `"austin-only"` | 是 | `austin-only` 或 `transferable`，详见下文。 |
 | `maxPeerMessagesPerTurn` | `6` | 是 | 每个用户回合最多触发多少条 peer 消息，最小值为 `4`，避免审查、修复和复验闭环因配置而死锁。最后一个触发槽保留给 `important`/`decision`。 |
@@ -408,6 +411,17 @@ pi
 布尔值使用小写 `true`/`false`。配置数值应使用合理的正数；过大的消息预算会增加费用和上下文噪声。
 
 旧配置缺少新字段时会自动补默认值；非法 `writePolicy` 会回退到 `austin-only`。
+
+### Tony 扩展白名单
+
+Tony 默认加载 `pi-web-access` 与 `pi-lens`，以及 pi-duo 自己的协作工具；不会加载 Austin 的 SoL-Pi、cc-extensions、footer 等其他扩展。两个默认包须已通过 Pi 安装。
+
+```text
+/duo config tonyExtensions=pi-web-access,pi-lens
+/duo config tonyExtensions=none
+```
+
+值是逗号分隔的 npm 包名，`none` 表示不加载额外扩展。修改只写入项目的 `.pi-duo/config.json`；为避免在生成途中替换工具集，需要 `/reload` 或停止并恢复 Tony 后才对 Tony session 生效。白名单包缺失时 Pi 会报告扩展加载错误，不会退回到加载全部扩展。
 
 ## 两种写入策略
 

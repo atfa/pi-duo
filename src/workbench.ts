@@ -109,7 +109,11 @@ export class DuoTranscript implements Component {
   private static readonly FOOTER_ROWS = 3;
   private static readonly FIXED_ROWS = 1 + 1 + 1 + DuoTranscript.FOOTER_ROWS + 1 + 1;
 
-  constructor(private readonly tui: TUI, private readonly cwd: string) {
+  constructor(
+    private readonly tui: TUI,
+    private readonly cwd: string,
+    private readonly maxRowsProvider?: () => number,
+  ) {
     const austinDocument = new VStack();
     const tonyDocument = new VStack();
     const austinColumn = new ScrollView(austinDocument, {
@@ -141,6 +145,10 @@ export class DuoTranscript implements Component {
   }
 
   render(width: number): string[] {
+    // Pi re-renders an overlay after a terminal resize but exposes no resize
+    // event to extensions. Reading the live budget here keeps this panel in
+    // step with that render without reconstructing the overlay.
+    if (this.maxRowsProvider) this.setMaxRows(this.maxRowsProvider());
     const header = new EqualColumns(
       new Text("Austin", 1, 0),
       new Text("Tony", 1, 0),
@@ -149,6 +157,14 @@ export class DuoTranscript implements Component {
     const bodyLimit = Math.max(0, this.maxRows - DuoTranscript.FIXED_ROWS);
     const bodyRows = this.columns.render(width);
     const body = bodyLimit ? bodyRows.slice(-bodyLimit) : [];
+    // The overlay is non-capturing, so it must still occupy its whole viewport
+    // when a transcript is short; otherwise Pi's native transcript shows below it.
+    while (body.length < bodyLimit) {
+      const divider = Math.floor(Math.max(2, width - 1) / 2);
+      body.push(
+        compositeTuiLine(" ".repeat(width), "│", divider, 1, width),
+      );
+    }
     const footer: string[] = [];
     for (let index = 0; index < DuoTranscript.FOOTER_ROWS; index++) {
       footer.push(new EqualColumns(

@@ -18,6 +18,7 @@ import type {
 } from "./types.js";
 
 export const DEFAULT_CONFIG: DuoConfig = {
+  tonyExtensions: ["pi-web-access", "pi-lens"],
   maxPeerMessagesPerTurn: 6,
   maxDeferredMessagesPerTurn: 2,
   maxConsecutivePeerTurns: 4,
@@ -31,6 +32,16 @@ export const MIN_PEER_MESSAGES_PER_TURN = 4;
 
 export function normalizeConfig(config: DuoConfig): DuoConfig {
   const normalized = { ...config };
+  normalized.tonyExtensions = [
+    ...new Set(
+      (Array.isArray(normalized.tonyExtensions)
+        ? normalized.tonyExtensions
+        : DEFAULT_CONFIG.tonyExtensions
+      )
+        .map((name) => (typeof name === "string" ? name.trim() : ""))
+        .filter(isTonyExtensionPackage),
+    ),
+  ];
   if (
     !Number.isSafeInteger(normalized.maxPeerMessagesPerTurn) ||
     normalized.maxPeerMessagesPerTurn < MIN_PEER_MESSAGES_PER_TURN
@@ -60,6 +71,19 @@ export function normalizeConfig(config: DuoConfig): DuoConfig {
   )
     normalized.writePolicy = DEFAULT_CONFIG.writePolicy;
   return normalized;
+}
+
+export function isTonyExtensionPackage(name: string): boolean {
+  return /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/.test(name);
+}
+
+export function resolveTonyExtensionPaths(
+  agentDir: string,
+  packages: readonly string[],
+): string[] {
+  return packages
+    .filter(isTonyExtensionPackage)
+    .map((name) => path.join(agentDir, "npm", "node_modules", name));
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
