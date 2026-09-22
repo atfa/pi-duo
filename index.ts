@@ -1147,28 +1147,33 @@ export default function piDuo(pi: ExtensionAPI) {
     state: DuoState,
     previousResponseEmpty: boolean,
   ): Promise<"triggered" | "paused" | false> => {
+    const collaboration = state.collaboration;
+    const phase = collaboration?.phase;
     if (
       !store ||
       state.status !== "active" ||
-      state.collaboration?.phase !== "execute" ||
-      state.review ||
-      state.finalizedUserTurn === state.collaboration.userTurn ||
+      !collaboration ||
+      !phase ||
+      state.review?.status === "pending" ||
+      (phase === "complete" && state.review?.status === "reported") ||
+      state.finalizedUserTurn === collaboration?.userTurn ||
       tonyRunning
     ) return false;
 
-    const attempts = state.collaboration.closeoutRecoveryAttempts ?? 0;
-    if (state.collaboration.closeoutRecoveryPaused || attempts >= 2) {
-      if (!state.collaboration.closeoutRecoveryPaused) {
+    const samePhase = collaboration.closeoutRecoveryPhase === phase;
+    const attempts = samePhase ? collaboration.closeoutRecoveryAttempts ?? 0 : 0;
+    if (samePhase && (collaboration.closeoutRecoveryPaused || attempts >= 2)) {
+      if (!collaboration.closeoutRecoveryPaused) {
         await store.update((draft) => {
           const collaboration = draft.collaboration;
           if (!collaboration) return;
           if (
             collaboration.userTurn === state.collaboration?.userTurn &&
-            collaboration.phase === "execute"
+            collaboration.phase === phase
           ) collaboration.closeoutRecoveryPaused = true;
         });
         foregroundUI?.notify(
-          "pi-duo: Austin 两次自动收口仍未推进，协作已暂停，等待用户继续。",
+          "pi-duo: Austin 两次自动推进均未取得进展，协作已暂停，等待用户继续。",
           "warning",
         );
       }
@@ -1181,20 +1186,26 @@ export default function piDuo(pi: ExtensionAPI) {
       if (!collaboration) return;
       if (
         collaboration.userTurn === state.collaboration?.userTurn &&
-        collaboration.phase === "execute" &&
-        !draft.review
+        collaboration.phase === phase &&
+        draft.review?.status !== "pending"
       ) {
         collaboration.closeoutRecoveryAttempts = attempts + 1;
+        collaboration.closeoutRecoveryPhase = phase;
         delete collaboration.closeoutRecoveryPaused;
       }
     });
     setReviewIndicator("waiting");
+    const prompt = phase === "execute"
+      ? "The collaboration is still in EXECUTE with no verification pending. Reconcile the shared pi-duo todos now. If material work remains, continue it; otherwise call duo_checkpoint(action='ready_for_verification') and summarize the completed implementation. Do not stop after merely describing the next step."
+      : phase === "explore" || phase === "converge"
+        ? `The collaboration is still in ${phase.toUpperCase()} and both agents are idle. Actively advance it now: use duo_send to exchange the missing contribution or decision, and use duo_plan when the shared plan is ready. Do not silently wait for the user.`
+        : "The Duo workflow stopped before completion. Reconcile the shared todos and verification state, address the outstanding verification or failure, and actively continue the workflow rather than waiting for the user.";
     sendMessageSafely(
       {
         customType: "pi-duo-closeout-recovery",
         content:
           `[Duo automatic closeout recovery ${attempts + 1}/2]${previousResponseEmpty ? " Your previous assistant response was empty." : " Your previous turn ended without advancing the Duo workflow."}\n` +
-          "The collaboration is still in EXECUTE with no verification pending. Reconcile the shared pi-duo todos now. If material work remains, continue it; otherwise call duo_checkpoint(action='ready_for_verification') and summarize the completed implementation. Do not stop after merely describing the next step.",
+          prompt,
         display: true,
       },
       { triggerTurn: true, deliverAs: "followUp" },
@@ -2808,7 +2819,7 @@ export default function piDuo(pi: ExtensionAPI) {
       const recovery = await recoverAustinCloseout(state, false);
       if (recovery === "triggered") {
         ctx.ui.notify(
-          "pi-duo: 检测到中断在 EXECUTE，正在自动恢复 Austin 收口。",
+          "pi-duo: 检测到协作中断，正在自动恢复 Austin 推进工作流。",
           "info",
         );
       } else if (!recovery && needsFinalization) {

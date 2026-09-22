@@ -1851,7 +1851,7 @@ async function closeoutRecoveryHarness(
     draft.agents.austin.sessionId = "closeout-session";
     draft.collaboration = {
       userTurn: 1,
-      phase: recoverOnStart ? phase : "explore",
+      phase: recoverOnStart ? phase : "complete",
       austinContributed: true,
       tonyContributed: true,
       tonyInitialContribution: true,
@@ -1859,6 +1859,9 @@ async function closeoutRecoveryHarness(
       contested: false,
       planRevision: 1,
     };
+    if (!recoverOnStart) {
+      draft.review = { userTurn: 1, status: "reported", updatedAt: new Date().toISOString() };
+    }
   });
 
   const events = new Map<string, Array<(...args: any[]) => any>>();
@@ -1890,6 +1893,7 @@ async function closeoutRecoveryHarness(
   if (!recoverOnStart) {
     await store.update((draft) => {
       if (draft.collaboration) draft.collaboration.phase = phase;
+      delete draft.review;
     });
     sent.length = 0;
     notices.length = 0;
@@ -1949,7 +1953,7 @@ test("EXECUTE agent end recovers empty Austin closeout twice, then pauses", asyn
       ).length,
       2,
     );
-    assert.ok(harness.notices.some((message) => /两次自动收口/.test(message)));
+    assert.ok(harness.notices.some((message) => /两次自动推进/.test(message)));
     const state = await harness.store.readState();
     assert.equal(state?.collaboration?.closeoutRecoveryAttempts, 2);
     assert.equal(state?.collaboration?.closeoutRecoveryPaused, true);
@@ -1958,21 +1962,46 @@ test("EXECUTE agent end recovers empty Austin closeout twice, then pauses", asyn
   }
 });
 
-test("closeout recovery does not run outside EXECUTE", async () => {
+test("idle EXPLORE Austin is automatically recovered", async () => {
   const harness = await closeoutRecoveryHarness("explore");
   try {
     await harness.emit("agent_start");
     await harness.emit("agent_end");
-    assert.equal(
-      harness.sent.some(({ message }) =>
-        message.customType === "pi-duo-closeout-recovery"
-      ),
-      false,
+    const recovery = harness.sent.find(({ message }) =>
+      message.customType === "pi-duo-closeout-recovery"
     );
+    assert.ok(recovery);
+    assert.match(recovery.message.content, /EXPLORE.*duo_send.*duo_plan/i);
     assert.equal(
       (await harness.store.readState())?.collaboration?.closeoutRecoveryAttempts,
-      undefined,
+      1,
     );
+  } finally {
+    await rm(harness.cwd, { recursive: true, force: true });
+  }
+});
+
+test("recovery retries reset when the collaboration phase advances and never wake reported completion", async () => {
+  const harness = await closeoutRecoveryHarness("explore");
+  try {
+    for (let index = 0; index < 2; index++) {
+      await harness.emit("agent_start");
+      await harness.emit("agent_end");
+    }
+    await harness.store.update((draft) => { draft.collaboration!.phase = "execute"; });
+    await harness.emit("agent_start");
+    await harness.emit("agent_end");
+    const state = await harness.store.readState();
+    assert.equal(state?.collaboration?.closeoutRecoveryAttempts, 1);
+    assert.equal(state?.collaboration?.closeoutRecoveryPhase, "execute");
+
+    await harness.store.update((draft) => {
+      draft.collaboration!.phase = "complete";
+      draft.review = { userTurn: 1, status: "reported", updatedAt: new Date().toISOString() };
+    });
+    const sent = harness.sent.length;
+    await harness.emit("agent_end");
+    assert.equal(harness.sent.length, sent);
   } finally {
     await rm(harness.cwd, { recursive: true, force: true });
   }

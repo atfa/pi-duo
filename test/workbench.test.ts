@@ -8,6 +8,7 @@ import {
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import {
   DuoTranscript,
+  isDuoPolicyBlock,
   toWorkbenchPreview,
   type LiveToolState,
 } from "../src/workbench.js";
@@ -225,4 +226,31 @@ test("DuoTranscript applies live partial and final tool results", () => {
     .find((child: unknown) => child instanceof ToolExecutionComponent) as any;
   assert.equal(tool.isPartial, false);
   assert.equal(tool.result.content[0].text, "done");
+});
+
+test("DuoTranscript hides policy-blocked tools but keeps real tool failures", () => {
+  const blocked = {
+    ...assistant,
+    content: [{ type: "toolCall", id: "blocked", name: "write", arguments: { path: "x" } }],
+  };
+  const failed = {
+    ...assistant,
+    content: [{ type: "toolCall", id: "failed", name: "write", arguments: { path: "y" } }],
+  };
+  const transcript = new DuoTranscript(tui, process.cwd());
+  transcript.update(
+    {
+      label: "Austin", cwd: process.cwd(), messages: [blocked, failed,
+        { role: "toolResult", toolCallId: "blocked", content: [{ type: "text", text: "Collaboration is still in EXPLORE. Austin must contribute." }], isError: true },
+        { role: "toolResult", toolCallId: "failed", content: [{ type: "text", text: "disk full" }], isError: true },
+      ],
+    },
+    { label: "Tony", cwd: process.cwd(), messages: [] },
+  );
+  const tools = (transcript as any).austinDocument.children
+    .filter((child: unknown) => child instanceof ToolExecutionComponent) as any[];
+  assert.equal(tools.length, 1);
+  assert.equal(tools[0].result.isError, true);
+  assert.equal(tools[0].result.content[0].text, "disk full");
+  assert.equal(isDuoPolicyBlock({ content: [{ type: "text", text: "disk full" }] }), false);
 });

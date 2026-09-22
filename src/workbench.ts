@@ -30,6 +30,31 @@ export interface LiveToolState {
   final?: any;
 }
 
+function toolResultText(result: any): string {
+  if (typeof result === "string") return result;
+  if (!Array.isArray(result?.content)) return "";
+  return result.content
+    .filter((part: any) => typeof part?.text === "string")
+    .map((part: any) => part.text)
+    .join("\n");
+}
+
+/** Policy blocks are intentional control-plane replies, not failed tool runs. */
+export function isDuoPolicyBlock(result: any): boolean {
+  const text = toolResultText(result);
+  return [
+    "Collaboration is still in EXPLORE.",
+    "First Collaboration Barrier:",
+    "Collaboration is in CONVERGE.",
+    "The deliverable is currently under independent verification.",
+    "The verified deliverable is COMPLETE.",
+    "Austin-only write policy:",
+    "Workspace write lock is owned by",
+    "Tony already sent this turn's consolidated peer message.",
+    "Tony must not sleep or poll for Austin.",
+  ].some((reason) => text.includes(reason));
+}
+
 const MAX_PREVIEW_PARTS = 16;
 const MAX_TEXT_PREVIEW = 4_000;
 const MAX_THINKING_PREVIEW = 1_500;
@@ -310,6 +335,14 @@ export class DuoTranscript implements Component {
     document.clear();
     const pending = new Map<string, ToolExecutionComponent>();
     const rendered = new Set<string>();
+    const suppressed = new Set<string>();
+    for (const message of transcript.messages) {
+      if (message?.role === "toolResult" && isDuoPolicyBlock(message))
+        suppressed.add(message.toolCallId);
+    }
+    for (const [id, state] of transcript.tools ?? []) {
+      if (state.final && isDuoPolicyBlock(state.final)) suppressed.add(id);
+    }
     for (const message of transcript.messages) {
       if (message?.role === "assistant") {
         if (!Array.isArray(message.content)) continue;
@@ -319,6 +352,7 @@ export class DuoTranscript implements Component {
         document.addChild(assistant);
         for (const content of preview.content ?? []) {
           if (content?.type !== "toolCall") continue;
+          if (suppressed.has(content.id)) continue;
           // Tool registries are session-private. Undefined selects Pi's native
           // fallback renderer, which is the correct cross-session renderer.
           const tool = new ToolExecutionComponent(
@@ -332,6 +366,7 @@ export class DuoTranscript implements Component {
           this.applyLiveTool(tool, transcript.tools?.get(content.id));
         }
       } else if (message?.role === "toolResult") {
+        if (suppressed.has(message.toolCallId)) continue;
         pending.get(message.toolCallId)?.updateResult(toWorkbenchPreview(message));
         pending.delete(message.toolCallId);
       } else if (message?.role === "user") {
@@ -346,7 +381,7 @@ export class DuoTranscript implements Component {
       }
     }
     for (const [id, state] of transcript.tools ?? []) {
-      if (rendered.has(id)) continue;
+      if (rendered.has(id) || suppressed.has(id)) continue;
       const tool = new ToolExecutionComponent(
         state.name, id, previewToolArguments(state.args), undefined, undefined,
         this.tui, this.cwd,

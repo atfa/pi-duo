@@ -83,9 +83,11 @@ export interface DuoCollaborationState {
   plan?: string;
   unresolvedObjection?: string;
   degraded?: boolean;
-  /** Durable Austin closeout retries for this user turn. */
+  /** Durable Austin workflow-recovery retries for this user turn. */
   closeoutRecoveryAttempts?: number;
-  /** True after the bounded retries ended without leaving EXECUTE. */
+  /** Phase the durable recovery retries belong to. */
+  closeoutRecoveryPhase?: CollaborationPhase;
+  /** True after bounded workflow recovery retries stopped advancing this phase. */
   closeoutRecoveryPaused?: boolean;
 }
 
