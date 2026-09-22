@@ -1,138 +1,26 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1440" viewBox="0 0 1080 1440" role="img" aria-labelledby="title desc">
-  <title id="title">pi-duo 宣传图</title>
-  <desc id="desc">一个 Pi，两个持久智能体。Austin 前台实现，Tony 后台审查。</desc>
+  <title id="title">pi-duo：两个持久 Agent，一套完整工作流</title>
+  <desc id="desc">pi-duo 让 Austin 在前台实现和集成，让 Tony 在后台调查、测试和独立验收；二者经历探索、收敛、执行和验证的完整阶段链。支持可搜索模型选择、干净新会话与卡住后的自动推进，更多 Token 用于提升本地小模型的工作质量。</desc>
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#071018"/>
-      <stop offset="0.48" stop-color="#10102a"/>
-      <stop offset="1" stop-color="#071c22"/>
-    </linearGradient>
-    <radialGradient id="auraA" cx="0" cy="0" r="1" gradientTransform="translate(230 375) rotate(28) scale(530 470)">
-      <stop offset="0" stop-color="#8b5cf6" stop-opacity=".45"/>
-      <stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/>
-    </radialGradient>
-    <radialGradient id="auraB" cx="0" cy="0" r="1" gradientTransform="translate(860 780) rotate(145) scale(540 500)">
-      <stop offset="0" stop-color="#19e6c8" stop-opacity=".32"/>
-      <stop offset="1" stop-color="#19e6c8" stop-opacity="0"/>
-    </radialGradient>
-    <linearGradient id="logo" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#b79cff"/>
-      <stop offset=".52" stop-color="#ffffff"/>
-      <stop offset="1" stop-color="#37f3d1"/>
-    </linearGradient>
-    <linearGradient id="cardA" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#281a51"/>
-      <stop offset="1" stop-color="#12182a"/>
-    </linearGradient>
-    <linearGradient id="cardB" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#093d3c"/>
-      <stop offset="1" stop-color="#101b29"/>
-    </linearGradient>
-    <pattern id="grid" width="54" height="54" patternUnits="userSpaceOnUse">
-      <path d="M54 0H0V54" fill="none" stroke="#99a6c7" stroke-opacity=".07" stroke-width="1"/>
-    </pattern>
-    <filter id="glowPurple" x="-80%" y="-80%" width="260%" height="260%">
-      <feGaussianBlur stdDeviation="15" result="b"/>
-      <feFlood flood-color="#9f7aea" flood-opacity=".7"/>
-      <feComposite in2="b" operator="in"/>
-      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
-    <filter id="glowMint" x="-80%" y="-80%" width="260%" height="260%">
-      <feGaussianBlur stdDeviation="13" result="b"/>
-      <feFlood flood-color="#27e8c7" flood-opacity=".65"/>
-      <feComposite in2="b" operator="in"/>
-      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
-    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%">
-      <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#000" flood-opacity=".42"/>
-    </filter>
-    <clipPath id="round"><rect width="1080" height="1440" rx="44"/></clipPath>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#080b1b"/><stop offset=".48" stop-color="#171034"/><stop offset="1" stop-color="#061d22"/></linearGradient>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#b69aff"/><stop offset=".5" stop-color="#fff"/><stop offset="1" stop-color="#40efd1"/></linearGradient>
+    <linearGradient id="aCard" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#372063"/><stop offset="1" stop-color="#151a32"/></linearGradient>
+    <linearGradient id="tCard" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#084d4a"/><stop offset="1" stop-color="#111d2c"/></linearGradient>
+    <radialGradient id="purple" cx="0" cy="0" r="1" gradientTransform="translate(155 315) rotate(35) scale(540 470)"><stop stop-color="#8b5cf6" stop-opacity=".42"/><stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/></radialGradient>
+    <radialGradient id="mint" cx="0" cy="0" r="1" gradientTransform="translate(925 830) rotate(145) scale(560 520)"><stop stop-color="#15d9ba" stop-opacity=".32"/><stop offset="1" stop-color="#15d9ba" stop-opacity="0"/></radialGradient>
+    <pattern id="grid" width="54" height="54" patternUnits="userSpaceOnUse"><path d="M54 0H0V54" fill="none" stroke="#b2b8d8" stroke-opacity=".07"/></pattern>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%"><feDropShadow dx="0" dy="15" stdDeviation="18" flood-color="#000" flood-opacity=".42"/></filter>
+    <filter id="glow" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="10" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
   </defs>
-
-  <g clip-path="url(#round)">
-    <rect width="1080" height="1440" fill="url(#bg)"/>
-    <rect width="1080" height="1440" fill="url(#auraA)"/>
-    <rect width="1080" height="1440" fill="url(#auraB)"/>
-    <rect width="1080" height="1440" fill="url(#grid)"/>
-
-    <g opacity=".35">
-      <path d="M-80 226H360L492 94H760" fill="none" stroke="#ad91ff" stroke-width="2"/>
-      <path d="M740 1346H936L1120 1162" fill="none" stroke="#2ce7c9" stroke-width="2"/>
-      <circle cx="361" cy="225" r="6" fill="#ad91ff"/>
-      <circle cx="936" cy="1346" r="6" fill="#2ce7c9"/>
-    </g>
-
-    <g font-family="Inter, SF Pro Display, PingFang SC, Noto Sans CJK SC, Arial, sans-serif">
-      <g transform="translate(72 70)">
-        <rect width="290" height="54" rx="27" fill="#ffffff" fill-opacity=".08" stroke="#ffffff" stroke-opacity=".15"/>
-        <circle cx="28" cy="27" r="7" fill="#39f0d0" filter="url(#glowMint)"/>
-        <text x="50" y="35" fill="#dce7ff" font-size="22" font-weight="650" letter-spacing="2">PI CODING AGENT</text>
-      </g>
-
-      <text x="70" y="230" fill="#f5f7ff" font-size="74" font-weight="800" letter-spacing="1">一个 Pi</text>
-      <text x="70" y="322" fill="url(#logo)" font-size="108" font-weight="900" letter-spacing="-3" filter="url(#glowPurple)">两个大脑</text>
-      <text x="74" y="378" fill="#aeb9d5" font-size="28" font-weight="500" letter-spacing="4">PERSISTENT PEER AGENTS</text>
-
-      <g transform="translate(70 445)" filter="url(#shadow)">
-        <g transform="rotate(-2 235 236)">
-          <rect width="465" height="474" rx="36" fill="url(#cardA)" stroke="#9b7af2" stroke-opacity=".72" stroke-width="2"/>
-          <rect x="24" y="24" width="124" height="38" rx="19" fill="#9f7aea" fill-opacity=".18"/>
-          <text x="48" y="50" fill="#cfc0ff" font-size="20" font-weight="750" letter-spacing="2">FOREGROUND</text>
-          <circle cx="232" cy="160" r="76" fill="#9f7aea" fill-opacity=".13" stroke="#ad91ff" stroke-width="3"/>
-          <text x="232" y="192" text-anchor="middle" fill="#d8ccff" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="94" font-weight="800" filter="url(#glowPurple)">A</text>
-          <text x="232" y="290" text-anchor="middle" fill="#ffffff" font-size="43" font-weight="820">Austin</text>
-          <text x="232" y="338" text-anchor="middle" fill="#b9bed2" font-size="26" font-weight="550">前台实现 · 唯一写入者</text>
-          <path d="M89 385H375" stroke="#8d77cc" stroke-opacity=".55"/>
-          <text x="232" y="425" text-anchor="middle" fill="#d7d3e8" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20">CODE  •  INTEGRATE  •  SHIP</text>
-        </g>
-      </g>
-
-      <g transform="translate(545 470)" filter="url(#shadow)">
-        <g transform="rotate(2 235 236)">
-          <rect width="465" height="474" rx="36" fill="url(#cardB)" stroke="#31d8bd" stroke-opacity=".72" stroke-width="2"/>
-          <rect x="24" y="24" width="132" height="38" rx="19" fill="#27e8c7" fill-opacity=".14"/>
-          <text x="45" y="50" fill="#81f5df" font-size="20" font-weight="750" letter-spacing="2">BACKGROUND</text>
-          <circle cx="232" cy="160" r="76" fill="#20d8b9" fill-opacity=".11" stroke="#31dfc2" stroke-width="3"/>
-          <text x="232" y="192" text-anchor="middle" fill="#92ffe9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="94" font-weight="800" filter="url(#glowMint)">T</text>
-          <text x="232" y="290" text-anchor="middle" fill="#ffffff" font-size="43" font-weight="820">Tony</text>
-          <text x="232" y="338" text-anchor="middle" fill="#b9cfce" font-size="26" font-weight="550">后台调查 · 测试 · 审查</text>
-          <path d="M89 385H375" stroke="#32bda8" stroke-opacity=".48"/>
-          <text x="232" y="425" text-anchor="middle" fill="#c9e2df" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20">TEST  •  CHALLENGE  •  REVIEW</text>
-        </g>
-      </g>
-
-      <g transform="translate(70 1004)">
-        <text x="0" y="0" fill="#ffffff" font-size="32" font-weight="780">独立会话</text>
-        <text x="238" y="0" fill="#ffffff" font-size="32" font-weight="780">实时互审</text>
-        <text x="476" y="0" fill="#ffffff" font-size="32" font-weight="780">默认单写者</text>
-        <text x="750" y="0" fill="#ffffff" font-size="32" font-weight="780">随时恢复</text>
-        <rect x="0" y="20" width="145" height="5" rx="2.5" fill="#9f7aea"/>
-        <rect x="238" y="20" width="145" height="5" rx="2.5" fill="#7d8fff"/>
-        <rect x="476" y="20" width="177" height="5" rx="2.5" fill="#3fd5c1"/>
-        <rect x="750" y="20" width="145" height="5" rx="2.5" fill="#31e3c4"/>
-      </g>
-
-      <g transform="translate(70 1082)">
-        <rect width="940" height="142" rx="28" fill="#050a12" fill-opacity=".7" stroke="#8c98b8" stroke-opacity=".28"/>
-        <circle cx="32" cy="30" r="6" fill="#ff6b81"/>
-        <circle cx="54" cy="30" r="6" fill="#ffd166"/>
-        <circle cx="76" cy="30" r="6" fill="#35e0bb"/>
-        <text x="34" y="86" fill="#8793ad" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="25">›</text>
-        <text x="70" y="86" fill="#f5f7ff" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="25">/duo start --peer provider/model</text>
-        <rect x="34" y="105" width="504" height="3" fill="#30e6c5" opacity=".75"/>
-      </g>
-
-      <g transform="translate(70 1280)">
-        <text x="0" y="0" fill="url(#logo)" font-size="62" font-weight="900" letter-spacing="-2">PI-DUO</text>
-        <text x="0" y="45" fill="#9da9c5" font-size="22" letter-spacing="1.5">TWO AGENTS. ONE SHARED GOAL.</text>
-        <g transform="translate(620 -12)">
-          <rect width="320" height="74" rx="22" fill="#ffffff" fill-opacity=".08" stroke="#ffffff" stroke-opacity=".18"/>
-          <text x="160" y="31" text-anchor="middle" fill="#ffffff" font-size="21" font-weight="720">github.com/atfa/pi-duo</text>
-          <text x="160" y="57" text-anchor="middle" fill="#54e7cc" font-size="17" font-weight="600">安装 · 配置 · 完整文档</text>
-        </g>
-      </g>
-    </g>
-
-    <rect x="18" y="18" width="1044" height="1404" rx="34" fill="none" stroke="#ffffff" stroke-opacity=".08" stroke-width="2"/>
+  <rect width="1080" height="1440" rx="44" fill="url(#bg)"/><rect width="1080" height="1440" rx="44" fill="url(#purple)"/><rect width="1080" height="1440" rx="44" fill="url(#mint)"/><rect width="1080" height="1440" rx="44" fill="url(#grid)"/>
+  <g font-family="Inter, SF Pro Display, PingFang SC, Noto Sans CJK SC, Arial, sans-serif">
+    <g transform="translate(70 66)"><rect width="278" height="52" rx="26" fill="#fff" fill-opacity=".08" stroke="#fff" stroke-opacity=".18"/><circle cx="27" cy="26" r="7" fill="#3cebd0" filter="url(#glow)"/><text x="48" y="34" fill="#dce6ff" font-size="20" font-weight="700" letter-spacing="2">PI CODING AGENT</text><text x="830" y="34" text-anchor="end" fill="#b9c4de" font-size="21" font-weight="650">v0.3.6</text></g>
+    <text x="70" y="212" fill="#f7f8ff" font-size="69" font-weight="850">两个 Agent</text><text x="70" y="302" fill="url(#brand)" font-size="76" font-weight="900" letter-spacing="-2">一套完整工作流</text><text x="74" y="352" fill="#abb7d3" font-size="25" font-weight="600" letter-spacing="2">持续协作，不是任务结束后才 review 一次</text>
+    <g transform="translate(70 402)" filter="url(#shadow)"><rect width="940" height="310" rx="32" fill="#0a101c" fill-opacity=".76" stroke="#d7ddff" stroke-opacity=".18"/><path d="M125 164H815" fill="none" stroke="#65708f" stroke-opacity=".5" stroke-width="3"/><g fill="#b7a2ff"><circle cx="125" cy="164" r="12"/><circle cx="355" cy="164" r="12"/></g><g fill="#48e6cf"><circle cx="585" cy="164" r="12"/><circle cx="815" cy="164" r="12"/></g><g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" font-weight="800" text-anchor="middle"><text x="125" y="111" fill="#d4c6ff">EXPLORE</text><text x="355" y="111" fill="#d4c6ff">CONVERGE</text><text x="585" y="111" fill="#9af7e7">EXECUTE</text><text x="815" y="111" fill="#9af7e7">VERIFY</text></g><g fill="#91a0bf" font-size="20" text-anchor="middle"><text x="125" y="218">一起拆解问题</text><text x="355" y="218">对齐可执行方案</text><text x="585" y="218">实现 · 集成</text><text x="815" y="218">测试 · 独立验收</text></g><text x="470" y="274" text-anchor="middle" fill="#e8ecfa" font-size="23" font-weight="700">每个阶段都有双 Agent 参与与回传</text></g>
+    <g transform="translate(70 766)" filter="url(#shadow)"><rect width="448" height="332" rx="30" fill="url(#aCard)" stroke="#ae91ff" stroke-opacity=".7" stroke-width="2"/><rect x="25" y="25" width="126" height="36" rx="18" fill="#b294ff" fill-opacity=".18"/><text x="48" y="50" fill="#dbceff" font-size="18" font-weight="800" letter-spacing="1.5">FOREGROUND</text><circle cx="94" cy="126" r="42" fill="#af93ff" fill-opacity=".17" stroke="#b9a1ff" stroke-width="2"/><text x="94" y="144" text-anchor="middle" fill="#e4dbff" font-family="ui-monospace, monospace" font-size="54" font-weight="900">A</text><text x="158" y="122" fill="#fff" font-size="39" font-weight="850">Austin</text><text x="158" y="158" fill="#d6caee" font-size="22" font-weight="650">前台实现 / 集成</text><path d="M30 207H418" stroke="#baa5ef" stroke-opacity=".35"/><text x="35" y="247" fill="#fff" font-size="24" font-weight="750">动手把方案落进代码</text><text x="35" y="284" fill="#c2bdd4" font-size="20">保持任务上下文，持续推进</text></g>
+    <g transform="translate(562 766)" filter="url(#shadow)"><rect width="448" height="332" rx="30" fill="url(#tCard)" stroke="#43e2c8" stroke-opacity=".7" stroke-width="2"/><rect x="25" y="25" width="130" height="36" rx="18" fill="#42e7ce" fill-opacity=".15"/><text x="47" y="50" fill="#a6f9e9" font-size="18" font-weight="800" letter-spacing="1.5">BACKGROUND</text><circle cx="94" cy="126" r="42" fill="#38e1c6" fill-opacity=".15" stroke="#5df1d9" stroke-width="2"/><text x="94" y="144" text-anchor="middle" fill="#c1fff3" font-family="ui-monospace, monospace" font-size="54" font-weight="900">T</text><text x="158" y="122" fill="#fff" font-size="39" font-weight="850">Tony</text><text x="158" y="158" fill="#cae7e2" font-size="22" font-weight="650">调查 / 测试 / 独立验收</text><path d="M30 207H418" stroke="#68ddcb" stroke-opacity=".35"/><text x="35" y="247" fill="#fff" font-size="24" font-weight="750">在后台找漏洞、验证结果</text><text x="35" y="284" fill="#c0d8d5" font-size="20">不是附加一次的事后 review</text></g>
+    <g transform="translate(70 1140)"><rect width="940" height="156" rx="28" fill="#060b14" fill-opacity=".82" stroke="#adb9d2" stroke-opacity=".27"/><circle cx="34" cy="31" r="6" fill="#ff7185"/><circle cx="56" cy="31" r="6" fill="#ffcf65"/><circle cx="78" cy="31" r="6" fill="#3be4c7"/><text x="36" y="80" fill="#8998b6" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="24">›</text><text x="70" y="80" fill="#f5f7ff" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="24">/duo new</text><text x="36" y="119" fill="#8998b6" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="24">›</text><text x="70" y="119" fill="#54ebd2" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="24">/duo model</text><text x="270" y="119" fill="#abb8d0" font-size="21">可搜索选择 · 上下键确认</text><text x="650" y="80" fill="#c8b7ff" font-size="21" font-weight="750">干净新会话</text><text x="650" y="119" fill="#a7f4e5" font-size="21" font-weight="750">卡住自动推进 / 可恢复</text></g>
+    <g transform="translate(70 1342)"><text x="0" y="0" fill="url(#brand)" font-size="55" font-weight="900" letter-spacing="-2">PI-DUO</text><text x="0" y="37" fill="#b5c0d8" font-size="21" font-weight="650">更多 TOKEN · 提升本地小模型工作质量</text><text x="940" y="4" text-anchor="end" fill="#fff" font-size="20" font-weight="750">github.com/atfa/pi-duo</text><text x="940" y="37" text-anchor="end" fill="#5cebd1" font-size="18" font-weight="650">双 Agent 协作扩展</text></g>
   </g>
+  <rect x="18" y="18" width="1044" height="1404" rx="34" fill="none" stroke="#fff" stroke-opacity=".09" stroke-width="2"/>
 </svg>
