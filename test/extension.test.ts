@@ -62,6 +62,238 @@ test("transcript dedupe is bounded and never serializes full payloads", () => {
   assert.equal(unique.filter((message) => message.timestamp === "199").length, 1);
 });
 
+test("/duo model picker defaults to Tony, persists selection, and cancels Austin", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-model-picker-"));
+  try {
+    const store = new DuoStore(cwd);
+    const commands = new Map<string, any>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const picker: any[] = [];
+    const notices: string[] = [];
+    const models = [
+      { provider: "provider-a", id: "model/a", name: "A" },
+      { provider: "provider-b", id: "model/b", name: "B" },
+    ];
+    const ui = {
+      notify(message: string) { notices.push(message); }, setStatus() {}, setWidget() {},
+      custom(factory: any) {
+        return new Promise<void>((resolve) => {
+          const component = factory({ requestRender() {} }, {}, {}, resolve);
+          picker.push(component);
+        });
+      },
+    };
+    const api = {
+      async setModel() { return true; }, registerTool() {}, registerMessageRenderer() {}, sendMessage() {},
+      registerCommand(name: string, command: any) { commands.set(name, command.handler); },
+      on(name: string, handler: any) { events.set(name, [...(events.get(name) ?? []), handler]); },
+    } as unknown as ExtensionAPI;
+    piDuo(api);
+    const ctx: any = {
+      cwd, mode: "tui", ui, isIdle: () => true, abort() {},
+      model: models[0], scopedModels: [],
+      sessionManager: { getSessionId: () => "picker", getSessionFile: () => undefined },
+      modelRegistry: {
+        find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id),
+        getAvailable: () => models, getError: () => undefined,
+        refresh: async () => ({ errors: new Map(), aborted: false }),
+        getRegisteredProviderConfig: () => undefined, getRegisteredNativeProvider: () => undefined,
+      },
+    };
+    for (const handler of events.get("session_start") ?? []) await handler({}, ctx);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-a", modelId: "model/a" },
+    );
+    (api as any).__registerTonyTools({ registerTool() {}, on() {} }, undefined, {
+      isStreaming: false, model: models[0], modelRuntime: { registerProvider() {}, registerNativeProvider() {} },
+      setModel: async () => {},
+    });
+
+    const handler = commands.get("duo")!;
+    const selecting = handler("model", ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(picker.at(-1)?.constructor.name, "ModelSelectorComponent", notices.join("\n"));
+    picker.at(-1).getSearchInput().onSubmit();
+    await selecting;
+    assert.deepEqual((await store.readConfig()).agentB, { provider: "provider-a", modelId: "model/a" });
+
+    const canceling = handler("model austin", ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    picker.at(-1).handleInput("\u001b");
+    await canceling;
+    assert.deepEqual((await store.readConfig()).agentA, undefined);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("/duo start reloads saved distinct Austin and Tony models", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-start-models-"));
+  try {
+    const store = new DuoStore(cwd);
+    const savedAustin = { provider: "provider-b", modelId: "model/b" };
+    const savedTony = { provider: "provider-c", modelId: "model/c" };
+    const config = await store.readConfig();
+    config.agentA = savedAustin;
+    config.agentB = savedTony;
+    await store.writeConfig(config);
+    const commands = new Map<string, any>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const selected: any[] = [];
+    const models = [
+      { provider: "provider-a", id: "model/a" },
+      { provider: "provider-b", id: "model/b" },
+      { provider: "provider-c", id: "model/c" },
+    ];
+    const api = {
+      async setModel(model: any) { selected.push(model); return true; },
+      registerTool() {}, registerMessageRenderer() {}, sendMessage() {},
+      registerCommand(name: string, command: any) { commands.set(name, command.handler); },
+      on(name: string, handler: any) { events.set(name, [...(events.get(name) ?? []), handler]); },
+    } as unknown as ExtensionAPI;
+    piDuo(api);
+    const ctx: any = {
+      cwd, mode: "rpc", ui: { notify() {}, setStatus() {}, setWidget() {} },
+      isIdle: () => true, abort() {}, model: models[0],
+      sessionManager: { getSessionId: () => "saved-models", getSessionFile: () => undefined },
+      modelRegistry: {
+        find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id),
+        getAvailable: () => models, getRegisteredProviderConfig: () => undefined, getRegisteredNativeProvider: () => undefined,
+      },
+    };
+    for (const handler of events.get("session_start") ?? []) await handler({}, ctx);
+    await commands.get("duo")!("start", ctx);
+    const state = await store.readState();
+    assert.deepEqual(selected, [models[1]]);
+    assert.deepEqual(state?.agents.austin, { name: "Austin", ...savedAustin, sessionId: "saved-models" });
+    assert.deepEqual({ provider: state?.agents.tony.provider, modelId: state?.agents.tony.modelId }, savedTony);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("/duo new creates a replacement Austin session with saved models", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-new-session-"));
+  try {
+    const store = new DuoStore(cwd);
+    const savedAustin = { provider: "provider-b", modelId: "model/b" };
+    const savedTony = { provider: "provider-c", modelId: "model/c" };
+    const config = await store.readConfig();
+    config.agentA = savedAustin;
+    config.agentB = savedTony;
+    await store.writeConfig(config);
+    const commands = new Map<string, any>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const selected: any[] = [];
+    const notices: string[] = [];
+    let reloads = 0;
+    const models = [
+      { provider: "provider-a", id: "model/a" },
+      { provider: "provider-b", id: "model/b" },
+      { provider: "provider-c", id: "model/c" },
+    ];
+    const api = {
+      async setModel(model: any) { selected.push(model); return true; },
+      registerTool() {}, registerMessageRenderer() {}, sendMessage() {},
+      registerCommand(name: string, command: any) { commands.set(name, command.handler); },
+      on(name: string, handler: any) { events.set(name, [...(events.get(name) ?? []), handler]); },
+    } as unknown as ExtensionAPI;
+    piDuo(api);
+    const ctx: any = {
+      cwd, mode: "rpc", ui: { notify(message: string) { notices.push(message); }, setStatus() {}, setWidget() {} },
+      isIdle: () => true, abort() {}, model: models[0],
+      sessionManager: { getSessionId: () => "old-session", getSessionFile: () => "old.jsonl" },
+      modelRegistry: {
+        find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id),
+        getAvailable: () => models, getRegisteredProviderConfig: () => undefined, getRegisteredNativeProvider: () => undefined,
+      },
+      async newSession(options: any) {
+        await options.setup({ getSessionId: () => "new-session", getSessionFile: () => "new.jsonl" });
+        await options.withSession({
+          ui: { notify(message: string) { notices.push(message); } },
+          async reload() { reloads++; },
+        });
+        return { cancelled: false };
+      },
+    };
+    for (const handler of events.get("session_start") ?? []) await handler({}, ctx);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-a", modelId: "model/a" },
+    );
+
+    await commands.get("duo")!("new --goal \"fresh goal\"", ctx);
+
+    const state = await store.readState();
+    assert.deepEqual(selected, [models[1]]);
+    assert.equal(state?.agents.austin.sessionId, "new-session");
+    assert.equal(state?.agents.austin.sessionFile, "new.jsonl");
+    assert.notEqual(state?.agents.austin.sessionId, "old-session");
+    assert.equal(state?.goal, "fresh goal");
+    assert.deepEqual({ provider: state?.agents.tony.provider, modelId: state?.agents.tony.modelId }, savedTony);
+    assert.equal(reloads, 1);
+    assert.ok(notices.some((message) => message.startsWith("New Duo session:")));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("/duo new cancellation preserves the current Duo and restores its model", async () => {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-new-cancel-"));
+  try {
+    const store = new DuoStore(cwd);
+    const config = await store.readConfig();
+    config.agentA = { provider: "provider-b", modelId: "model/b" };
+    await store.writeConfig(config);
+    const commands = new Map<string, any>();
+    const events = new Map<string, Array<(...args: any[]) => any>>();
+    const selected: any[] = [];
+    const models = [
+      { provider: "provider-a", id: "model/a" },
+      { provider: "provider-b", id: "model/b" },
+    ];
+    const api = {
+      async setModel(model: any) { selected.push(model); return true; },
+      registerTool() {}, registerMessageRenderer() {}, sendMessage() {},
+      registerCommand(name: string, command: any) { commands.set(name, command.handler); },
+      on(name: string, handler: any) { events.set(name, [...(events.get(name) ?? []), handler]); },
+    } as unknown as ExtensionAPI;
+    piDuo(api);
+    const ctx: any = {
+      cwd, mode: "rpc", ui: { notify() {}, setStatus() {}, setWidget() {} },
+      isIdle: () => true, abort() {}, model: models[0],
+      sessionManager: { getSessionId: () => "old-session", getSessionFile: () => "old.jsonl" },
+      modelRegistry: {
+        find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id),
+        getAvailable: () => models, getRegisteredProviderConfig: () => undefined, getRegisteredNativeProvider: () => undefined,
+      },
+      async newSession() { return { cancelled: true }; },
+    };
+    for (const handler of events.get("session_start") ?? []) await handler({}, ctx);
+    await store.create(
+      { provider: "provider-a", modelId: "model/a" },
+      { provider: "provider-a", modelId: "model/a" },
+    );
+    await store.update((state) => {
+      state.agents.austin.sessionId = "old-session";
+      state.goal = "keep this Duo";
+    });
+
+    await commands.get("duo")!("new", ctx);
+
+    assert.deepEqual(selected, [models[1], models[0]]);
+    assert.equal((await store.readState())?.agents.austin.sessionId, "old-session");
+    assert.equal((await store.readState())?.goal, "keep this Duo");
+    assert.deepEqual((await store.readConfig()).agentA, {
+      provider: "provider-b",
+      modelId: "model/b",
+    });
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("extension registers commands, tools, renderer, and lifecycle hooks without network access", () => {
   const tools: string[] = [];
   const commands: string[] = [];

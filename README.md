@@ -12,15 +12,29 @@
 <p align="center">
   <a href="https://github.com/atfa/pi-duo"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-atfa%2Fpi--duo-181717?logo=github"></a>
   <img alt="Pi" src="https://img.shields.io/badge/Pi-%E2%89%A5%200.85.1-7C3AED">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.3.5-00C2A8">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.3.6-00C2A8">
   <img alt="Tests" src="https://img.shields.io/badge/tests-passing-22C55E">
 </p>
 
-> **0.3.5 提示**：双栏工作台现在会限制本地模型的大载荷、避免 reload 时叠加覆盖层，并能有界恢复被中断的最终收口。任务彻底完成后，顶部会持续显示 `✓ pi-duo 协作任务彻底完成`；该状态可跨 reload 恢复，不会重复唤醒 Austin。
+<p align="center">
+  <a href="assets/pi-duo.mp4"><strong>▶ 观看 pi-duo 演示视频</strong></a>
+</p>
+
+> **0.3.6 提示**：可用 `/duo new` 开始干净的新会话，`/duo model` 可搜索并保存两位角色的模型；未完成工作流在双方空闲时会跨阶段自动推进或明确暂停。
 
 ## 为什么需要 pi-duo？
 
-普通 subagent 往往是一次性调用：主 Agent 提问，子 Agent 返回一段结果，然后上下文消失。pi-duo 采用不同的方式：
+pi-duo 面向需要持续协作和独立验收的任务，不是“多跑一次 review”，也不是一次性 disposable subagent。
+
+| | 常见 work-review 流程 | pi-duo |
+| --- | --- | --- |
+| 协作方式 | 单 Agent 完成后，由 reviewer 事后审查一次 | Austin 与 Tony 是可恢复的持久 session，从独立探索到独立验收持续协作 |
+| 工作流 | 实现 → review | EXPLORE 独立观点 → CONVERGE 共识 → EXECUTE 分工 → VERIFY 独立验收 |
+| 上下文与控制 | review 通常只拿到一次输入 | 真实 session context、共享状态、写入控制与卡住自动推进 |
+
+这会增加 token 消耗；它的价值主要在于提高本地小参数模型处理复杂任务时的工作质量、稳定性和完成率。简单任务或能力较强的云模型场景，额外协作成本未必值得，可按需启用。
+
+具体来说：
 
 - **对等双 Agent**：Austin 和 Tony 都是有独立历史的、可恢复的持久 Pi session；
 - **真实 context 通信**：peer 消息进入对方真实 session/context，支持语义分类与彩色渲染；
@@ -57,6 +71,8 @@ flowchart LR
 
 - **两个持久 Agent**：Austin 使用当前前台 Pi session；Tony 使用后台 SDK `AgentSession`。
 - **可选模型组合**：两个角色可以使用同一模型，也可以使用不同 provider/model。
+- **可搜索模型选择器**：`/duo model` 选择 Tony，`/duo model austin` 选择 Austin；选择会持久化并在下次启动时加载。
+- **干净新会话**：`/duo new` 创建新的 Pi + Duo session，清空当前 transcript。
 - **真实 context 通信**：`duo_send` 把消息写入 peer 的持久会话。
 - **后台自动协作**：默认每条普通用户任务都会同时派发给 Tony。
 - **审查完成门控**：Tony 首份报告到达前，Austin 的终稿会明确标为预备结果；报告到达后自动唤醒 Austin 收口。
@@ -66,8 +82,7 @@ flowchart LR
 - **高级可转移写锁**：`transferable` 模式允许双方显式交接 workspace ownership。
 - **循环保护**：总消息预算、连续 peer-only 限制、相似消息抑制、关键消息 deferred 槽。
 - **可靠恢复**：`/duo stop` 保留历史，`/duo resume` 恢复两个 session。
-- **中断续接**：若进程停在“Tony 已验收、Austin 尚未最终回复”，reload/resume 会自动恢复最后收口；已 finalized 的任务不会重复执行。
-- **有界收口恢复**：Austin 在 `EXECUTE` 中提前结束或返回空响应时自动续接，最多两次；仍未推进则明确暂停，不会无限消耗 token。
+- **跨阶段 idle 自动推进**：工作流尚未完成而双方空闲时，pi-duo 会续接下一步；有界重试后仍无法推进会明确暂停，不会无限消耗 token。
 - **并发安全**：revision、原子 rename、跨进程锁和 stale-lock recovery。
 
 ## 环境要求
@@ -140,7 +155,7 @@ ln -sfn "$PWD" ~/.pi/agent/extensions/pi-duo
 
 修改源码后在 Pi 中运行 `/reload`。
 
-若当前 Duo 仍有 `pending` review，新的 `/duo start` 会被拒绝，避免静默丢失正在进行的审查。确实要放弃当前运行时，先执行 `/duo stop`，再重新 `/duo start`。
+若当前 Duo 仍有 `pending` review，`/duo start` 和 `/duo new` 都会被拒绝，避免静默丢失正在进行的审查。确实要放弃当前运行时，先执行 `/duo stop`。
 
 ## 5 分钟快速开始
 
@@ -161,7 +176,7 @@ pi
 
 ### 2. 选择初始模型
 
-先用 Pi 的模型选择功能选好初始模型。执行 `/duo start` 时，当前模型会同时用于 Austin 和 Tony，并写入 `config.json` 的 `agentA` / `agentB`；旧配置不会阻止切换模型。
+先用 Pi 的模型选择功能选好初始模型。执行 `/duo start` 时会优先加载 `config.json` 中已保存的 Austin/Tony 模型；首次启动或缺少该项时才使用当前模型。
 
 ### 3. 启动 Duo
 
@@ -172,8 +187,10 @@ pi
 启动后如需使用不同模型，通过 `/duo model` 调整：
 
 ```text
-/duo model --tony openrouter/anthropic/claude-sonnet-4.5
+/duo model
 ```
+
+`/duo model` 打开 Tony 的可搜索模型选择器；`/duo model austin` 打开 Austin 的选择器。上下键选择、回车确认，Esc 取消；选择会保存到配置供下一次 `/duo start` 使用。
 
 ### 4. 确认状态
 
@@ -221,9 +238,11 @@ Pi 原生 `/resume` 与 `/duo resume` 解决的是两件不同的事：
 | 命令 | 用途 | 中止工作 | 自动触发模型继续工作 |
 |---|---|---|---|
 | `/duo`、`/duo status` | 显示当前 Duo 状态 | 否 | 否 |
-| `/duo start ...` | 新建 Duo，并把当前 session 设为 Austin | 会替换可安全重建的旧状态 | 否，等待用户输入任务 |
+| `/duo start ...` | 在当前 Pi session 重建 Duo，并把它设为 Austin | 会替换可安全重建的旧状态 | 否，等待用户输入任务 |
+| `/duo new ...` | 创建全新的 Pi + Duo session（清空当前 transcript） | 会替换可安全重建的旧状态 | 否，等待用户输入任务 |
 | `/duo resume` | 恢复状态中固定的 Austin/Tony session | 否 | 通常否；仅处理中断中的 review 或最终收口，见下文 |
-| `/duo model [--austin\|--tony] provider/model` | 切换一方或双方模型并持久化 | 否 | 否；双方必须处于空闲状态 |
+| `/duo model [austin\|tony]` | 打开对应角色的可搜索模型选择器并持久化 | 否 | 否；目标必须空闲 |
+| `/duo model [--austin\|--tony] provider/model` | 按模型 ID 切换一方或双方（兼容旧用法） | 否 | 否；双方必须处于空闲状态 |
 | `/duo stop` | 停止 Austin、Tony 和整个 Duo | 是，双方 | 否 |
 | `/duo stop austin` | 只停止 Austin 当前回合 | 是，仅 Austin | 否 |
 | `/duo stop tony` | 只停止 Tony，Duo 降级运行 | 是，仅 Tony | 会通知正在运行的 Austin 已降级 |
@@ -267,10 +286,13 @@ Pi 原生 `/resume` 与 `/duo resume` 解决的是两件不同的事：
 ```text
 /duo start
 /duo start --goal "目标"
+/duo new
+/duo new --goal "目标"
 ```
 
-- 当前 Pi session 成为 Austin；
-- 当前前台模型同时成为 Austin 与 Tony 的初始模型，并覆盖 `config.json` 中旧的 `agentA` / `agentB`；
+- `/duo start` 让当前 Pi session 成为 Austin，适合刚进入 Duo 或在当前对话中重建状态；
+- `/duo new` 创建新的 Pi session，让旧 transcript 从界面消失，并在其中创建新的 Austin/Tony；
+- 已保存的 `agentA` / `agentB` 会分别成为 Austin 与 Tony 的初始模型；缺少配置时当前前台模型作为回退；
 - `--goal` 设置初始共享目标；
 - 命令完成后只建立双方 session 和工作现场，不会自动执行新任务；下一条普通用户输入才会启动协作。
 
@@ -281,6 +303,13 @@ Pi 原生 `/resume` 与 `/duo resume` 解决的是两件不同的事：
 /duo model --tony llama/think
 ```
 
+也可以直接打开选择器（默认 Tony）：
+
+```text
+/duo model
+/duo model austin
+```
+
 省略角色参数会同时切换双方：
 
 ```text
@@ -289,7 +318,7 @@ Pi 原生 `/resume` 与 `/duo resume` 解决的是两件不同的事：
 
 模型切换会同步更新两个活跃 session、`.pi-duo/config.json` 与 `.pi-duo/state.json`。为避免正在生成的请求跨模型，目标 Agent 工作中时命令会拒绝执行；等待其空闲或先用 `/duo stop austin|tony` 中止当前回合。`provider/model` 的 model 部分可以继续包含 `/`。
 
-> **注意**：`/duo start` 创建新的共享 Duo 状态，不是恢复命令。已有会话应优先使用 `/duo resume`，避免重新初始化 goal、todo 和 decisions。
+> **注意**：`/duo start` 只创建新的共享 Duo 状态，不会清空当前 Pi transcript；需要真正的新对话请用 `/duo new`。已有 Duo 应优先使用 `/duo resume`，避免重新初始化 goal、todo 和 decisions。
 
 ### 暂停
 
@@ -399,8 +428,8 @@ pi
 
 | 配置项 | 默认值 | `/duo config` | 说明 |
 | --- | --- | --- | --- |
-| `agentA` | 启动时记录 | 否 | Austin 的 `{provider, modelId}`；由 `/duo start` 或 `/duo model` 更新。 |
-| `agentB` | 启动时记录 | 否 | Tony 的 `{provider, modelId}`；初始与 Austin 相同，可由 `/duo model` 分开。 |
+| `agentA` | 当前前台模型 | 否 | Austin 的 `{provider, modelId}`；由 `/duo model` 更新，并在下次启动时加载。 |
+| `agentB` | Austin 模型 | 否 | Tony 的 `{provider, modelId}`；由 `/duo model` 更新，并在下次启动时加载。 |
 | `tonyExtensions` | `["pi-web-access", "pi-lens"]` | 是 | Tony 专用扩展白名单。只接受已安装的 npm 包名；不会继承 Austin 的其他扩展。 |
 | `autoDispatch` | `true` | 是 | `true`：每个普通用户任务自动派发给 Tony；`false`：只在 Austin 显式调用 `duo_send` 时联系 Tony。 |
 | `writePolicy` | `"austin-only"` | 是 | `austin-only` 或 `transferable`，详见下文。 |
@@ -698,11 +727,12 @@ src/types.ts             共享类型
 test/*.test.ts           离线回归测试
 config.example.json      完整配置示例
 assets/pi-duo-xhs.png    3:4 宣传图
+assets/pi-duo.mp4        演示视频
 ```
 
 ## 项目状态
 
-当前定位：**v0.3.5 beta / release candidate**。
+当前定位：**v0.3.6 beta / release candidate**。
 
 已经过以下真实场景验证：
 
