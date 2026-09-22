@@ -12,11 +12,11 @@
 <p align="center">
   <a href="https://github.com/atfa/pi-duo"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-atfa%2Fpi--duo-181717?logo=github"></a>
   <img alt="Pi" src="https://img.shields.io/badge/Pi-%E2%89%A5%200.85.1-7C3AED">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.3.4-00C2A8">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.3.5-00C2A8">
   <img alt="Tests" src="https://img.shields.io/badge/tests-passing-22C55E">
 </p>
 
-> **0.3.4 提示**：双栏工作台现在采用固定布局、单侧节流刷新与有界可视历史，长会话更稳定。任务彻底完成后，顶部会持续显示 `✓ pi-duo 协作任务彻底完成`；该状态可跨 reload 恢复，不会重复唤醒 Austin。
+> **0.3.5 提示**：双栏工作台现在会限制本地模型的大载荷、避免 reload 时叠加覆盖层，并能有界恢复被中断的最终收口。任务彻底完成后，顶部会持续显示 `✓ pi-duo 协作任务彻底完成`；该状态可跨 reload 恢复，不会重复唤醒 Austin。
 
 ## 为什么需要 pi-duo？
 
@@ -700,7 +700,7 @@ assets/pi-duo-xhs.png    3:4 宣传图
 
 ## 项目状态
 
-当前定位：**v0.3.4 beta / release candidate**。
+当前定位：**v0.3.5 beta / release candidate**。
 
 已经过以下真实场景验证：
 
