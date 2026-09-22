@@ -301,11 +301,7 @@ export class DuoTranscript implements Component {
     this.notice = notice ?? "";
   }
 
-  /**
-   * Rows Austin's native transcript components occupy at Pi's full width.
-   * The workbench uses this only to reserve the uncovered portion above Pi's
-   * editor; it never changes the persisted session or the display viewport.
-   */
+  /** Full-width Austin rows sampled only at stable layout boundaries. */
   austinDocumentRows(width: number): number {
     return this.austinDocument.render(Math.max(1, width)).length;
   }

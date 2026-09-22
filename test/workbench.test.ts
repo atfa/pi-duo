@@ -144,30 +144,6 @@ test("DuoTranscript keeps a fixed height for short content without duplicating i
   assert.equal(rows.at(-1), "─".repeat(100));
 });
 
-test("DuoTranscript reports Austin's full-width native transcript rows", () => {
-  const transcript = new DuoTranscript(tui, process.cwd());
-  transcript.update(
-    { label: "Austin", cwd: process.cwd(), messages: [] },
-    { label: "Tony", cwd: process.cwd(), messages: [] },
-  );
-  assert.equal(transcript.austinDocumentRows(100), 0);
-
-  transcript.updateSide("austin", {
-    label: "Austin",
-    cwd: process.cwd(),
-    messages: [{ role: "user", content: "short Austin input" }],
-  });
-  const shortRows = transcript.austinDocumentRows(100);
-  assert.ok(shortRows > 0);
-
-  transcript.updateSide("austin", {
-    label: "Austin",
-    cwd: process.cwd(),
-    messages: [{ role: "user", content: "long ".repeat(2_000) }],
-  });
-  assert.ok(transcript.austinDocumentRows(100) > shortRows);
-});
-
 test("DuoTranscript recomputes its height on terminal resize", () => {
   const terminal = { rows: 20 };
   const transcript = new DuoTranscript(

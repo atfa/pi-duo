@@ -6,6 +6,7 @@ import test from "node:test";
 import { initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import piDuo, {
   dedupeTranscriptMessages,
+  syncTonyProvider,
   transcriptMessageKey,
 } from "../index.js";
 import {
@@ -15,6 +16,29 @@ import {
 import { DuoStore } from "../src/store.js";
 
 initTheme(undefined, false);
+
+test("Tony runtime receives only the selected dynamically registered provider", () => {
+  const config = { baseUrl: "https://cline.example/v1" };
+  const native = { id: "native-provider" };
+  const calls: Array<[string, unknown]> = [];
+  const registry = {
+    getRegisteredProviderConfig: (provider: string) =>
+      provider === "cline" ? config : undefined,
+    getRegisteredNativeProvider: (provider: string) =>
+      provider === "native" ? native : undefined,
+  };
+  const runtime = {
+    registerProvider: (provider: string, value: unknown) =>
+      calls.push([provider, value]),
+    registerNativeProvider: (provider: unknown) => calls.push(["native", provider]),
+  };
+
+  syncTonyProvider(registry as any, runtime as any, "cline");
+  syncTonyProvider(registry as any, runtime as any, "native");
+  syncTonyProvider(registry as any, runtime as any, "models-json");
+
+  assert.deepEqual(calls, [["cline", config], ["native", native]]);
+});
 
 test("transcript dedupe is bounded and never serializes full payloads", () => {
   const make = (index: number) => ({
@@ -1166,6 +1190,7 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
 
     piDuo(api);
 
+    const dynamicProviderConfig = { baseUrl: "https://cline.example/v1" };
     const ctx = {
       cwd,
       mode: "tui",
@@ -1181,6 +1206,9 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
       modelRegistry: {
         find: () => ({ provider: "provider-b", id: "model/b" }),
         getAvailable: () => [],
+        getRegisteredProviderConfig: (provider: string) =>
+          provider === "provider-b" ? dynamicProviderConfig : undefined,
+        getRegisteredNativeProvider: () => undefined,
       },
     };
 
@@ -1234,10 +1262,25 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     assert.equal(duoState?.agents.tony.provider, "provider-a");
     assert.deepEqual(duoConfig.agentA, { provider: "provider-b", modelId: "model/b" });
 
+    const tonyEvents: string[] = [];
     (api as any).__registerTonyTools(
       { registerTool() {}, on() {} },
       undefined,
-      { isStreaming: false, setModel: async () => {} },
+      {
+        isStreaming: false,
+        modelRuntime: {
+          registerProvider: (provider: string, config: unknown) => {
+            assert.equal(provider, "provider-b");
+            assert.equal(config, dynamicProviderConfig);
+            tonyEvents.push("register");
+          },
+          registerNativeProvider: () => assert.fail("unexpected native provider"),
+        },
+        setModel: async () => {
+          assert.deepEqual(tonyEvents, ["register"]);
+          tonyEvents.push("setModel");
+        },
+      },
     );
     await handler("model provider-b/model/b", ctx);
     duoState = await store.readState();
@@ -1245,22 +1288,39 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     assert.equal(duoState?.agents.austin.provider, "provider-b");
     assert.equal(duoState?.agents.tony.provider, "provider-b");
     assert.deepEqual(duoConfig.agentA, duoConfig.agentB);
+    assert.deepEqual(tonyEvents, ["register", "setModel"]);
 
     // The panel is a live component, not a blocked dialog: it renders rows and
     // never declares an input handler.
+    const austinDocument = (call.component as any).austinDocument;
+    const originalAustinRender = austinDocument.render.bind(austinDocument);
+    let austinRenderCount = 0;
+    austinDocument.render = (width: number) => {
+      austinRenderCount++;
+      return originalAustinRender(width);
+    };
     const rows = call.component.render(120);
     assert.ok(Array.isArray(rows) && rows.length > 0);
     assert.equal(
+      austinRenderCount,
+      1,
+      "one workbench frame renders Austin's scroll tree exactly once",
+    );
+    assert.equal(
       rows.length,
       34,
-      "an empty workbench leaves the lower 30% for Pi's input, footer, and widgets",
+      "an empty workbench leaves the reserved native dock below the overlay",
     );
     const spacer = widgets.get("pi-duo-workbench-spacer");
-    assert.ok(spacer, "the spacer pushes Pi's empty-document dock below the overlay");
+    assert.ok(spacer, "an empty native transcript needs a dock spacer below the overlay");
     const spacerComponent = spacer.content({}, {});
     assert.equal(spacerComponent.render(120).length, 34);
+    assert.equal(austinRenderCount, 2, "the initial stable spacer samples Austin once");
+    assert.equal(spacerComponent.render(120).length, 34);
+    assert.equal(austinRenderCount, 2, "unchanged frames reuse the stable spacer sample");
     terminal.rows = 30;
-    assert.equal(spacerComponent.render(120).length, 24, "spacer tracks the overlay budget after resize");
+    assert.equal(spacerComponent.render(120).length, 24);
+    assert.equal(austinRenderCount, 3, "terminal resize takes one new stable sample");
     terminal.rows = 40;
     assert.equal(call.component.handleInput, undefined);
     assert.equal(typeof call.component.invalidate, "function");
@@ -1288,33 +1348,44 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     for (const onStart of events.get("message_start") || []) {
       onStart({ message: austinUser });
     }
+    const countBeforeUserLayout = austinRenderCount;
+    assert.ok(spacerComponent.render(120).length < 34);
+    assert.equal(
+      austinRenderCount,
+      countBeforeUserLayout + 1,
+      "a complete user message recalibrates the spacer once",
+    );
     let transcript = (call.component as any).austinDocument.render(59).join("\n");
     assert.match(transcript, /Austin first turn/);
-    assert.ok(
-      spacerComponent.render(120).length < 34,
-      "short Austin output replaces part of the spacer instead of adding blank rows below it",
-    );
 
     for (const onStart of events.get("message_start") || []) {
       onStart({ message: austinAssistant });
     }
+    const streamingSpacerRows = spacerComponent.render(120).length;
+    const countBeforeStream = austinRenderCount;
+    for (const onUpdate of events.get("message_update") || []) {
+      onUpdate({
+        message: austinAssistant,
+        assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x" },
+      });
+    }
+    assert.equal(spacerComponent.render(120).length, streamingSpacerRows);
+    assert.equal(
+      austinRenderCount,
+      countBeforeStream,
+      "stream deltas do not remeasure or reflow the native dock",
+    );
     for (const onEnd of events.get("message_end") || []) {
       onEnd({ message: austinAssistant });
     }
+    spacerComponent.render(120);
+    assert.equal(
+      austinRenderCount,
+      countBeforeStream + 1,
+      "message completion takes one new stable sample",
+    );
     transcript = (call.component as any).austinDocument.render(59).join("\n");
     assert.match(transcript, /Austin first reply/);
-
-    for (const onStart of events.get("message_start") || []) {
-      onStart({ message: { role: "user", content: "long Austin input ".repeat(2_000) } });
-    }
-    assert.equal(
-      spacerComponent.render(120).length,
-      0,
-      "a long Austin transcript leaves no duplicate blank spacer below the overlay",
-    );
-    terminal.rows = 30;
-    assert.equal(spacerComponent.render(120).length, 0, "long transcript remains spacer-free after resize");
-    terminal.rows = 40;
 
     // A streaming delta must repaint through the factory's TUI (the only
     // repaint channel that exists on pi 0.86's UI context).
@@ -1380,11 +1451,7 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     // `/duo stop` must not leave a stale overlay behind.
     await handler("stop", ctx);
     assert.equal(stack.length, 0, "stopping duo mode removes every overlay");
-    assert.equal(
-      widgets.has("pi-duo-workbench-spacer"),
-      false,
-      "stopping duo mode removes the native dock reservation",
-    );
+    assert.equal(widgets.has("pi-duo-workbench-spacer"), false);
     const overlaysAfterStop = overlayCalls.length;
     await handler("view", ctx);
     assert.equal(

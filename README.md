@@ -417,6 +417,8 @@ pi
 
 Tony 默认加载 `pi-web-access` 与 `pi-lens`，以及 pi-duo 自己的协作工具；不会加载 Austin 的 SoL-Pi、cc-extensions、footer 等其他扩展。两个默认包须已通过 Pi 安装。
 
+Tony 的独立 ModelRuntime 会读取 Pi 的 `auth.json`/`models.json`，并同步当前所选、由前台扩展动态注册的 provider（如 Cline）；这不加载 Austin 的全部扩展或工具。
+
 ```text
 /duo config tonyExtensions=pi-web-access,pi-lens
 /duo config tonyExtensions=none

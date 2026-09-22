@@ -3,6 +3,7 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   getAgentDir,
+  ModelRuntime,
   SessionManager,
   SettingsManager,
   type AgentSession,
@@ -101,6 +102,18 @@ export function transcriptMessageKey(message: any): string {
   }
   parts.push(`n:${items.length}`);
   return parts.join("\u0000");
+}
+
+/** Copies a provider registered by the foreground extension into Tony's runtime. */
+export function syncTonyProvider(
+  registry: Pick<ModelRegistry, "getRegisteredProviderConfig" | "getRegisteredNativeProvider">,
+  runtime: Pick<ModelRuntime, "registerProvider" | "registerNativeProvider">,
+  provider: string,
+): void {
+  const config = registry.getRegisteredProviderConfig?.(provider);
+  if (config) runtime.registerProvider(provider, config);
+  const native = registry.getRegisteredNativeProvider?.(provider);
+  if (native) runtime.registerNativeProvider(native);
 }
 
 export function dedupeTranscriptMessages(messages: readonly any[]): any[] {
@@ -460,6 +473,7 @@ export default function piDuo(pi: ExtensionAPI) {
   // settled. Two non-capturing overlays can otherwise cover the native dock.
   let workbenchTask: Promise<void> | undefined;
   let workbenchRequestRender: ((force?: boolean) => void) | undefined;
+  let workbenchRemeasureSpacer: (() => void) | undefined;
   // Stream deltas can arrive much faster than a terminal can render. Keep the
   // first event responsive, then coalesce the rest into one trailing redraw.
   let workbenchRefreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -916,21 +930,33 @@ export default function piDuo(pi: ExtensionAPI) {
             // asks for options again rather than retaining a stale first frame.
             const panel = new DuoTranscript(tui, ctx?.cwd ?? process.cwd(), overlayRowBudget);
             workbenchPanel = panel;
-            // Pi lays an empty document's dock at the top. Reserve exactly the
-            // rows painted by this top overlay so the native editor/footer is
-            // always pushed below it, including after a terminal resize.
+            let spacerWidth = 0;
+            let spacerBudget = -1;
+            let stableAustinRows = 0;
+            let spacerNeedsMeasure = true;
+            workbenchRemeasureSpacer = () => {
+              spacerNeedsMeasure = true;
+            };
             ui.setWidget(
               WORKBENCH_SPACER_KEY,
               () => ({
-                render: (width: number) => Array.from(
-                  {
-                    length: Math.max(
-                      0,
-                      overlayRowBudget() - (workbenchPanel?.austinDocumentRows(width) ?? 0),
-                    ),
-                  },
-                  () => "",
-                ),
+                render: (width: number) => {
+                  const budget = overlayRowBudget();
+                  if (
+                    spacerNeedsMeasure ||
+                    width !== spacerWidth ||
+                    budget !== spacerBudget
+                  ) {
+                    stableAustinRows = panel.austinDocumentRows(width);
+                    spacerWidth = width;
+                    spacerBudget = budget;
+                    spacerNeedsMeasure = false;
+                  }
+                  return Array.from(
+                    { length: Math.max(0, budget - stableAustinRows) },
+                    () => "",
+                  );
+                },
                 invalidate() {},
               }),
               { placement: "aboveEditor" },
@@ -987,6 +1013,7 @@ export default function piDuo(pi: ExtensionAPI) {
           workbenchOverlayHide = undefined;
           workbenchPanel = undefined;
           workbenchRequestRender = undefined;
+          workbenchRemeasureSpacer = undefined;
         }
       });
     } catch {
@@ -1090,6 +1117,7 @@ export default function piDuo(pi: ExtensionAPI) {
     workbenchOverlayHide = undefined;
     workbenchPanel = undefined;
     workbenchRequestRender = undefined;
+    workbenchRemeasureSpacer = undefined;
     foregroundUI?.setWidget(WORKBENCH_SPACER_KEY, undefined, { placement: "aboveEditor" });
     if (close) close();
     else hideEntry?.();
@@ -2204,6 +2232,9 @@ export default function piDuo(pi: ExtensionAPI) {
     });
     api.on("message_start", (event) => {
       captureMessage(event.message);
+      if (actor === "austin" && event.message?.role !== "assistant") {
+        workbenchRemeasureSpacer?.();
+      }
       if (event.message?.role === "assistant") {
         if (actor === "austin") austinStreaming = event.message;
         else tonyStreaming = event.message;
@@ -2242,6 +2273,7 @@ export default function piDuo(pi: ExtensionAPI) {
         if (actor === "austin") austinStreaming = undefined;
         else tonyStreaming = undefined;
       }
+      if (actor === "austin") workbenchRemeasureSpacer?.();
       // Tool results are persisted after their execution event; this redraw
       // makes the native component converge even when that happens later.
       refreshWorkbench(false, actor);
@@ -2271,6 +2303,7 @@ export default function piDuo(pi: ExtensionAPI) {
         args: tools.get(event.toolCallId)?.args,
         final: result(event.result, event.isError),
       });
+      if (actor === "austin") workbenchRemeasureSpacer?.();
       refreshWorkbench(false, actor);
     });
   };
@@ -2313,14 +2346,15 @@ export default function piDuo(pi: ExtensionAPI) {
     // embedded Tony runtime can silently fall back to Pi's defaults (notably
     // the 300s provider timeout) while the foreground runtime uses a changed
     // global/project setting.
-    const settingsManager = SettingsManager.create(cwd, getAgentDir());
+    const agentDir = getAgentDir();
+    const settingsManager = SettingsManager.create(cwd, agentDir);
     const loader = new DefaultResourceLoader({
       cwd,
-      agentDir: getAgentDir(),
+      agentDir,
       settingsManager,
       noExtensions: true,
       additionalExtensionPaths: resolveTonyExtensionPaths(
-        getAgentDir(),
+        agentDir,
         config.tonyExtensions,
       ),
       extensionFactories: [
@@ -2328,6 +2362,11 @@ export default function piDuo(pi: ExtensionAPI) {
       ],
     });
     await loader.reload();
+    const modelRuntime = await ModelRuntime.create({
+      authPath: path.join(agentDir, "auth.json"),
+      modelsPath: path.join(agentDir, "models.json"),
+    });
+    syncTonyProvider(registry, modelRuntime, ref.provider);
     await currentStore.ensureTonyScratch();
     if (!isCurrentGeneration(generation)) return;
     const manager = state.agents.tony.sessionFile
@@ -2339,6 +2378,7 @@ export default function piDuo(pi: ExtensionAPI) {
       resourceLoader: loader,
       sessionManager: manager,
       settingsManager,
+      modelRuntime,
     });
     const activeTony = created.session;
     if (!isCurrentGeneration(generation)) {
@@ -3206,6 +3246,7 @@ export default function piDuo(pi: ExtensionAPI) {
         let changedTony = false;
         try {
           if (targets.includes("tony")) {
+            syncTonyProvider(ctx.modelRegistry, tony!.modelRuntime, ref.provider);
             await tony!.setModel(model);
             changedTony = true;
           }
