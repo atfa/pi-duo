@@ -1064,13 +1064,15 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
 
     const commands = new Map<string, (args: string, ctx: any) => Promise<any>>();
     const events = new Map<string, Array<(...args: any[]) => any>>();
-    const overlayCalls: Array<{ options: any; component: any }> = [];
+    const overlayCalls: Array<{ options: any; sourceOptions: any; component: any }> = [];
     let renderRequests = 0;
     let hidden = 0;
     let customSettled = 0;
     let handleHides = 0;
     let onHandleCalls = 0;
     let maxStackDepth = 0;
+    const widgets = new Map<string, { content: any; options: any }>();
+    const terminal = { rows: 40, columns: 120 };
 
     // Faithful model of pi-tui's REAL overlay semantics, not just pi 0.86's
     // `ExtensionUIContext` shape:
@@ -1089,11 +1091,14 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     const ui = {
       notify: () => {},
       setStatus: () => {},
-      setWidget: () => {},
+      setWidget: (key: string, content: any, options: any) => {
+        if (content === undefined) widgets.delete(key);
+        else widgets.set(key, { content, options });
+      },
       custom: (factory: any, options: any) => {
         const tui = {
           requestRender: () => { renderRequests++; },
-          terminal: { rows: 40, columns: 120 },
+          terminal,
         };
         let closed = false;
         let entry: { handle: { hide: () => void } } | undefined;
@@ -1101,12 +1106,16 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
         const done = () => {
           if (closed) return; // pi guards against a double close
           closed = true;
-          if (stack.length > 0) {
-            hidden++;
-            stack.pop(); // topmost-only pop, exactly like hideOverlay()
-          }
-          customSettled++;
-          resolveCustom();
+          // Pi's custom() teardown is asynchronous. Model that boundary so a
+          // stop → start test catches a second overlay being opened too early.
+          queueMicrotask(() => {
+            if (stack.length > 0) {
+              hidden++;
+              stack.pop(); // topmost-only pop, exactly like hideOverlay()
+            }
+            customSettled++;
+            resolveCustom();
+          });
         };
         const component = factory(tui, {}, {}, done);
         // pi resolves `overlayOptions` AFTER the factory runs, so a function
@@ -1115,7 +1124,7 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
           typeof options.overlayOptions === "function"
             ? options.overlayOptions()
             : options.overlayOptions;
-        overlayCalls.push({ component, options: { ...options, overlayOptions: resolved } });
+        overlayCalls.push({ component, sourceOptions: options, options: { ...options, overlayOptions: resolved } });
         entry = {
           handle: {
             hide: () => {
@@ -1203,9 +1212,16 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     assert.equal(call.options.overlayOptions.row, 0);
     assert.equal(call.options.overlayOptions.col, 0);
     assert.equal(call.options.overlayOptions.width, "100%");
-    // Pi resolves percentage bounds against the live terminal for every
-    // render; DuoTranscript separately reserves the current dock rows.
-    assert.equal(call.options.overlayOptions.maxHeight, "100%");
+    // A non-capturing overlay still composites blank body rows over its
+    // underlying content, so it must reserve Pi's input dock.
+    assert.equal(call.options.overlayOptions.maxHeight, 34);
+    terminal.rows = 30;
+    assert.equal(
+      call.sourceOptions.overlayOptions().maxHeight,
+      24,
+      "the overlay option reuses the live dock-aware row budget after resize",
+    );
+    terminal.rows = 40;
     // pi's own `showOverlay` repaints when the overlay is installed, so no
     // eager render call is needed at open time. What matters is that streaming
     // refreshes are wired to the REAL TUI handed to the factory.
@@ -1234,8 +1250,32 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     // never declares an input handler.
     const rows = call.component.render(120);
     assert.ok(Array.isArray(rows) && rows.length > 0);
+    assert.equal(
+      rows.length,
+      34,
+      "an empty workbench leaves the lower 30% for Pi's input, footer, and widgets",
+    );
+    const spacer = widgets.get("pi-duo-workbench-spacer");
+    assert.ok(spacer, "the spacer pushes Pi's empty-document dock below the overlay");
+    const spacerComponent = spacer.content({}, {});
+    assert.equal(spacerComponent.render(120).length, 34);
+    terminal.rows = 30;
+    assert.equal(spacerComponent.render(120).length, 24, "spacer tracks the overlay budget after resize");
+    terminal.rows = 40;
     assert.equal(call.component.handleInput, undefined);
     assert.equal(typeof call.component.invalidate, "function");
+
+    // Runtime activity, not the durable collaboration phase, owns the spinner.
+    for (const onAgentStart of events.get("agent_start") || []) {
+      await onAgentStart({});
+    }
+    let panelText = call.component.render(120).join("\n");
+    assert.match(panelText, /◐ Austin 正在工作/);
+    for (const onAgentEnd of events.get("agent_end") || []) {
+      await onAgentEnd({});
+    }
+    panelText = call.component.render(120).join("\n");
+    assert.doesNotMatch(panelText, /◐ Austin 正在工作/);
 
     // Pi emits these extension events before SessionManager appends them. The
     // first turn must therefore be visible in its column without waiting for
@@ -1250,6 +1290,10 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     }
     let transcript = (call.component as any).austinDocument.render(59).join("\n");
     assert.match(transcript, /Austin first turn/);
+    assert.ok(
+      spacerComponent.render(120).length < 34,
+      "short Austin output replaces part of the spacer instead of adding blank rows below it",
+    );
 
     for (const onStart of events.get("message_start") || []) {
       onStart({ message: austinAssistant });
@@ -1259,6 +1303,18 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     }
     transcript = (call.component as any).austinDocument.render(59).join("\n");
     assert.match(transcript, /Austin first reply/);
+
+    for (const onStart of events.get("message_start") || []) {
+      onStart({ message: { role: "user", content: "long Austin input ".repeat(2_000) } });
+    }
+    assert.equal(
+      spacerComponent.render(120).length,
+      0,
+      "a long Austin transcript leaves no duplicate blank spacer below the overlay",
+    );
+    terminal.rows = 30;
+    assert.equal(spacerComponent.render(120).length, 0, "long transcript remains spacer-free after resize");
+    terminal.rows = 40;
 
     // A streaming delta must repaint through the factory's TUI (the only
     // repaint channel that exists on pi 0.86's UI context).
@@ -1324,6 +1380,11 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
     // `/duo stop` must not leave a stale overlay behind.
     await handler("stop", ctx);
     assert.equal(stack.length, 0, "stopping duo mode removes every overlay");
+    assert.equal(
+      widgets.has("pi-duo-workbench-spacer"),
+      false,
+      "stopping duo mode removes the native dock reservation",
+    );
     const overlaysAfterStop = overlayCalls.length;
     await handler("view", ctx);
     assert.equal(
@@ -1331,6 +1392,11 @@ test("duo mode auto-opens a persistent non-capturing workbench overlay", async (
       overlaysAfterStop,
       "a stopped Duo cannot show a misleading empty workbench",
     );
+    // A fresh start immediately after an asynchronous close waits for the old
+    // `custom()` promise rather than stacking a second full-screen overlay.
+    await handler("start", ctx);
+    assert.equal(overlayCalls.length, overlaysAfterStop + 1);
+    assert.equal(stack.length, 1);
     assert.equal(handleHides, 0, "the happy path never double-removes");
     assert.equal(
       maxStackDepth,
@@ -1676,6 +1742,11 @@ test("streaming deltas coalesce workbench redraws without delaying the first fra
     await new Promise((resolve) => setTimeout(resolve, 250));
     const transcript = (panel as any).austinDocument.render(59).join("\n");
     assert.equal((transcript.match(/stream finished/g) || []).length, 1);
+    assert.doesNotMatch(
+      transcript,
+      /stream started|^delta$/m,
+      "superseded assistant snapshots must not survive beside the final message",
+    );
 
     // SessionManager may return a cloned object, so identity-only merging must
     // not render the same user turn twice either.
@@ -1696,6 +1767,147 @@ test("streaming deltas coalesce workbench redraws without delaying the first fra
   } finally {
     DuoStore.prototype.readState = originalReadState;
     await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+async function closeoutRecoveryHarness(
+  phase: "explore" | "execute" = "execute",
+  recoverOnStart = false,
+) {
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "pi-duo-closeout-test-"));
+  const store = new DuoStore(cwd);
+  await store.create(
+    { provider: "provider-a", modelId: "model/a" },
+    { provider: "provider-b", modelId: "model/b" },
+  );
+  await store.update((draft) => {
+    draft.agents.austin.sessionId = "closeout-session";
+    draft.collaboration = {
+      userTurn: 1,
+      phase: recoverOnStart ? phase : "explore",
+      austinContributed: true,
+      tonyContributed: true,
+      tonyInitialContribution: true,
+      tonyRespondedToAustin: true,
+      contested: false,
+      planRevision: 1,
+    };
+  });
+
+  const events = new Map<string, Array<(...args: any[]) => any>>();
+  const sent: Array<{ message: any; options: any }> = [];
+  const notices: string[] = [];
+  const api = {
+    registerTool() {},
+    registerCommand() {},
+    registerMessageRenderer() {},
+    sendMessage(message: any, options: any) { sent.push({ message, options }); },
+    on(name: string, handler: any) {
+      if (!events.has(name)) events.set(name, []);
+      events.get(name)!.push(handler);
+    },
+  } as unknown as ExtensionAPI;
+  piDuo(api);
+  for (const handler of events.get("session_start") || []) {
+    await handler({}, {
+      cwd,
+      sessionManager: { getSessionId: () => "closeout-session" },
+      modelRegistry: { find: () => undefined },
+      ui: {
+        notify: (message: string) => notices.push(message),
+        setStatus() {},
+        setWidget() {},
+      },
+    });
+  }
+  if (!recoverOnStart) {
+    await store.update((draft) => {
+      if (draft.collaboration) draft.collaboration.phase = phase;
+    });
+    sent.length = 0;
+    notices.length = 0;
+  }
+  const emit = async (name: string, event: any = {}) => {
+    for (const handler of events.get(name) || []) await handler(event);
+  };
+  return { cwd, store, sent, notices, emit };
+}
+
+test("session restore resumes an interrupted EXECUTE closeout", async () => {
+  const harness = await closeoutRecoveryHarness("execute", true);
+  try {
+    assert.equal(
+      harness.sent.filter(({ message }) =>
+        message.customType === "pi-duo-closeout-recovery"
+      ).length,
+      1,
+    );
+    assert.equal(
+      (await harness.store.readState())?.collaboration?.closeoutRecoveryAttempts,
+      1,
+    );
+  } finally {
+    await rm(harness.cwd, { recursive: true, force: true });
+  }
+});
+
+test("EXECUTE agent end recovers empty Austin closeout twice, then pauses", async () => {
+  const harness = await closeoutRecoveryHarness();
+  try {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await harness.emit("agent_start");
+      await harness.emit("message_end", {
+        message: { role: "assistant", content: [], stopReason: "stop" },
+      });
+      await harness.emit("agent_end");
+      const recovery = harness.sent.filter(({ message }) =>
+        message.customType === "pi-duo-closeout-recovery"
+      );
+      assert.equal(recovery.length, attempt);
+      assert.match(recovery.at(-1)!.message.content, /response was empty/i);
+      assert.deepEqual(recovery.at(-1)!.options, {
+        triggerTurn: true,
+        deliverAs: "followUp",
+      });
+    }
+
+    await harness.emit("agent_start");
+    await harness.emit("message_end", {
+      message: { role: "assistant", content: [], stopReason: "stop" },
+    });
+    await harness.emit("agent_end");
+    assert.equal(
+      harness.sent.filter(({ message }) =>
+        message.customType === "pi-duo-closeout-recovery"
+      ).length,
+      2,
+    );
+    assert.ok(harness.notices.some((message) => /两次自动收口/.test(message)));
+    const state = await harness.store.readState();
+    assert.equal(state?.collaboration?.closeoutRecoveryAttempts, 2);
+    assert.equal(state?.collaboration?.closeoutRecoveryPaused, true);
+  } finally {
+    await rm(harness.cwd, { recursive: true, force: true });
+  }
+});
+
+test("closeout recovery does not run outside EXECUTE", async () => {
+  const harness = await closeoutRecoveryHarness("explore");
+  try {
+    await harness.emit("agent_start");
+    await harness.emit("agent_end");
+    assert.equal(
+      harness.sent.some(({ message }) =>
+        message.customType === "pi-duo-closeout-recovery"
+      ),
+      false,
+    );
+    assert.equal(
+      (await harness.store.readState())?.collaboration?.closeoutRecoveryAttempts,
+      undefined,
+    );
+  } finally {
+    await rm(harness.cwd, { recursive: true, force: true });
   }
 });
 

@@ -83,6 +83,10 @@ export interface DuoCollaborationState {
   plan?: string;
   unresolvedObjection?: string;
   degraded?: boolean;
+  /** Durable Austin closeout retries for this user turn. */
+  closeoutRecoveryAttempts?: number;
+  /** True after the bounded retries ended without leaving EXECUTE. */
+  closeoutRecoveryPaused?: boolean;
 }
 
 export interface DuoState {

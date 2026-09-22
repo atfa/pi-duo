@@ -30,6 +30,92 @@ export interface LiveToolState {
   final?: any;
 }
 
+const MAX_PREVIEW_PARTS = 16;
+const MAX_TEXT_PREVIEW = 4_000;
+const MAX_THINKING_PREVIEW = 1_500;
+const MAX_TOOL_ARGS_PREVIEW = 2_000;
+const TRUNCATION_MARKER = "\n… [pi-duo display truncated; full content remains in session] …\n";
+
+function truncatePreview(value: string, limit: number): string {
+  if (value.length <= limit) return value;
+  const remaining = Math.max(0, limit - TRUNCATION_MARKER.length);
+  const head = Math.floor(remaining / 2);
+  return value.slice(0, head) + TRUNCATION_MARKER + value.slice(-(remaining - head));
+}
+
+function previewToolArguments(args: any): any {
+  const budget = { remaining: MAX_TOOL_ARGS_PREVIEW };
+  const seen = new WeakSet<object>();
+  const visit = (value: any, depth: number): any => {
+    if (budget.remaining <= 0) return "[display budget exhausted]";
+    budget.remaining -= 8;
+    if (typeof value === "string") {
+      const limit = Math.max(0, Math.min(value.length, budget.remaining));
+      budget.remaining -= limit;
+      return truncatePreview(value, limit);
+    }
+    if (value === null || typeof value !== "object") return value;
+    if (seen.has(value)) return "[circular value omitted]";
+    if (depth >= 4) return "[nested value omitted]";
+    seen.add(value);
+    if (Array.isArray(value)) {
+      const items = value.slice(0, 12).map((item) => visit(item, depth + 1));
+      if (value.length > 12) items.push(`[${value.length - 12} more items omitted]`);
+      return items;
+    }
+    const preview: Record<string, any> = {};
+    let fields = 0;
+    let omitted = false;
+    for (const key in value) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      if (fields++ >= 12) {
+        omitted = true;
+        break;
+      }
+      budget.remaining -= Math.min(key.length, 64);
+      preview[key] = visit(value[key], depth + 1);
+      if (budget.remaining <= 0) break;
+    }
+    if (omitted) preview["…"] = "[more fields omitted]";
+    return preview;
+  };
+  return visit(args ?? {}, 0);
+}
+
+/** A bounded display clone; the persisted message and model context stay intact. */
+export function toWorkbenchPreview(message: any): any {
+  if (!message || typeof message !== "object") return message;
+  if (message.role === "user" && typeof message.content === "string") {
+    return { ...message, content: truncatePreview(message.content, MAX_TEXT_PREVIEW) };
+  }
+  if (!Array.isArray(message.content)) return message;
+
+  const content = message.content.slice(-MAX_PREVIEW_PARTS).map((part: any) => {
+    if (!part || typeof part !== "object") return part;
+    if (part.type === "image" || part.type === "audio") {
+      return { type: "text", text: `[${part.type} omitted from pi-duo display]` };
+    }
+    if (part.type === "toolCall") {
+      const args = previewToolArguments(part.arguments);
+      return args === part.arguments ? part : { ...part, arguments: args };
+    }
+    if (typeof part.thinking === "string") {
+      return {
+        ...part,
+        thinking: truncatePreview(part.thinking, MAX_THINKING_PREVIEW),
+      };
+    }
+    if (typeof part.text === "string") {
+      return { ...part, text: truncatePreview(part.text, MAX_TEXT_PREVIEW) };
+    }
+    return part;
+  });
+  const preview = { ...message, content };
+  delete preview.details;
+  if (message.role === "assistant") delete preview.diagnostics;
+  return preview;
+}
+
 /**
  * Two real Pi transcript columns. This mirrors InteractiveMode's
  * assistant/tool rendering instead of inventing a second message format.
@@ -161,7 +247,10 @@ export class DuoTranscript implements Component {
     // when a transcript is short; otherwise Pi's native transcript shows below it.
     while (body.length < bodyLimit) {
       const divider = Math.floor(Math.max(2, width - 1) / 2);
-      body.push(
+      // Keep the newest transcript adjacent to Pi's input dock. Padding after
+      // short transcripts created a large, misleading dead zone between the
+      // visible work and the editor/footer.
+      body.unshift(
         compositeTuiLine(" ".repeat(width), "│", divider, 1, width),
       );
     }
@@ -212,6 +301,15 @@ export class DuoTranscript implements Component {
     this.notice = notice ?? "";
   }
 
+  /**
+   * Rows Austin's native transcript components occupy at Pi's full width.
+   * The workbench uses this only to reserve the uncovered portion above Pi's
+   * editor; it never changes the persisted session or the display viewport.
+   */
+  austinDocumentRows(width: number): number {
+    return this.austinDocument.render(Math.max(1, width)).length;
+  }
+
   private renderSession(document: VStack, transcript: SessionTranscript): void {
     document.clear();
     const pending = new Map<string, ToolExecutionComponent>();
@@ -219,10 +317,11 @@ export class DuoTranscript implements Component {
     for (const message of transcript.messages) {
       if (message?.role === "assistant") {
         if (!Array.isArray(message.content)) continue;
-        const assistant = new AssistantMessageComponent(message);
-        if (message === transcript.streaming) assistant.updateContent(message, true);
+        const preview = toWorkbenchPreview(message);
+        const assistant = new AssistantMessageComponent(preview);
+        if (message === transcript.streaming) assistant.updateContent(preview, true);
         document.addChild(assistant);
-        for (const content of message.content ?? []) {
+        for (const content of preview.content ?? []) {
           if (content?.type !== "toolCall") continue;
           // Tool registries are session-private. Undefined selects Pi's native
           // fallback renderer, which is the correct cross-session renderer.
@@ -237,12 +336,13 @@ export class DuoTranscript implements Component {
           this.applyLiveTool(tool, transcript.tools?.get(content.id));
         }
       } else if (message?.role === "toolResult") {
-        pending.get(message.toolCallId)?.updateResult(message);
+        pending.get(message.toolCallId)?.updateResult(toWorkbenchPreview(message));
         pending.delete(message.toolCallId);
       } else if (message?.role === "user") {
-        const text = typeof message.content === "string"
-          ? message.content
-          : (message.content ?? [])
+        const preview = toWorkbenchPreview(message);
+        const text = typeof preview.content === "string"
+          ? preview.content
+          : (preview.content ?? [])
               .filter((content: any) => content.type === "text")
               .map((content: any) => content.text)
               .join("\n");
@@ -252,7 +352,8 @@ export class DuoTranscript implements Component {
     for (const [id, state] of transcript.tools ?? []) {
       if (rendered.has(id)) continue;
       const tool = new ToolExecutionComponent(
-        state.name, id, state.args, undefined, undefined, this.tui, this.cwd,
+        state.name, id, previewToolArguments(state.args), undefined, undefined,
+        this.tui, this.cwd,
       );
       tool.setArgsComplete();
       this.applyLiveTool(tool, state);
@@ -263,7 +364,7 @@ export class DuoTranscript implements Component {
   private applyLiveTool(tool: ToolExecutionComponent, state?: LiveToolState): void {
     if (!state) return;
     if (state.started) tool.markExecutionStarted();
-    if (state.partial) tool.updateResult(state.partial, true);
-    if (state.final) tool.updateResult(state.final);
+    if (state.partial) tool.updateResult(toWorkbenchPreview(state.partial), true);
+    if (state.final) tool.updateResult(toWorkbenchPreview(state.final));
   }
 }

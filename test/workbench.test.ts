@@ -6,7 +6,11 @@ import {
   initTheme,
 } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
-import { DuoTranscript, type LiveToolState } from "../src/workbench.js";
+import {
+  DuoTranscript,
+  toWorkbenchPreview,
+  type LiveToolState,
+} from "../src/workbench.js";
 
 const tui = { requestRender() {} } as any;
 initTheme(undefined, false);
@@ -15,6 +19,44 @@ const assistant = {
   content: [{ type: "text", text: "native message" }],
   stopReason: "stop",
 };
+
+test("workbench previews bound local-model payloads without mutating sessions", () => {
+  const long = "x".repeat(100_000);
+  const args: any = {};
+  args.self = args;
+  args.body = long;
+  args.nested = { deeper: { value: long } };
+  const message = {
+    role: "assistant",
+    diagnostics: [{ payload: long }],
+    content: [
+      { type: "thinking", thinking: long },
+      { type: "toolCall", id: "large", name: "write", arguments: args },
+      { type: "text", text: long },
+    ],
+  };
+  const preview = toWorkbenchPreview(message);
+
+  assert.equal((message.content[0] as any).thinking.length, 100_000);
+  assert.equal((message.content[1] as any).arguments.body.length, 100_000);
+  assert.equal((message.content[1] as any).arguments.self, args);
+  assert.equal((message.content[2] as any).text.length, 100_000);
+  assert.ok(preview.content[0]!.thinking.length <= 1_500);
+  assert.match(preview.content[0]!.thinking, /display truncated/);
+  const argumentPreview = JSON.stringify(preview.content[1]!.arguments);
+  assert.ok(argumentPreview.length < 2_500);
+  assert.match(argumentPreview, /circular value omitted/);
+  assert.ok(preview.content[2]!.text.length <= 4_000);
+  assert.equal(preview.diagnostics, undefined);
+
+  const result = toWorkbenchPreview({
+    role: "toolResult",
+    content: [{ type: "text", text: long }],
+    details: { diff: long },
+  });
+  assert.ok(result.content[0].text.length <= 4_000);
+  assert.equal(result.details, undefined);
+});
 
 test("DuoTranscript keeps Austin left and Tony right with native messages", () => {
   const transcript = new DuoTranscript(tui, process.cwd());
@@ -97,8 +139,33 @@ test("DuoTranscript keeps a fixed height for short content without duplicating i
   const output = rows.join("\n");
   assert.equal(rows.length, 12);
   assert.equal(output.match(/Austin appears once/g)?.length, 1);
+  assert.match(rows.at(-2) ?? "", /Austin appears once/);
   assert.ok(rows.slice(7, -1).every((row) => row.indexOf("│") === 49));
   assert.equal(rows.at(-1), "─".repeat(100));
+});
+
+test("DuoTranscript reports Austin's full-width native transcript rows", () => {
+  const transcript = new DuoTranscript(tui, process.cwd());
+  transcript.update(
+    { label: "Austin", cwd: process.cwd(), messages: [] },
+    { label: "Tony", cwd: process.cwd(), messages: [] },
+  );
+  assert.equal(transcript.austinDocumentRows(100), 0);
+
+  transcript.updateSide("austin", {
+    label: "Austin",
+    cwd: process.cwd(),
+    messages: [{ role: "user", content: "short Austin input" }],
+  });
+  const shortRows = transcript.austinDocumentRows(100);
+  assert.ok(shortRows > 0);
+
+  transcript.updateSide("austin", {
+    label: "Austin",
+    cwd: process.cwd(),
+    messages: [{ role: "user", content: "long ".repeat(2_000) }],
+  });
+  assert.ok(transcript.austinDocumentRows(100) > shortRows);
 });
 
 test("DuoTranscript recomputes its height on terminal resize", () => {

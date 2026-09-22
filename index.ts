@@ -4,6 +4,7 @@ import {
   DefaultResourceLoader,
   getAgentDir,
   SessionManager,
+  SettingsManager,
   type AgentSession,
   type ExtensionAPI,
   type ExtensionCommandContext,
@@ -66,7 +67,11 @@ import type {
 } from "./src/types.js";
 import { DuoTranscript, type LiveToolState } from "./src/workbench.js";
 
-const TRANSCRIPT_MESSAGE_LIMIT = 40;
+// The workbench is a viewport, not a second full session renderer. Native Pi
+// components segment every visible character, so feeding long local-model
+// thinking/tool payloads here can exhaust V8 even though only a few terminal
+// rows survive the final crop.
+const TRANSCRIPT_MESSAGE_LIMIT = 20;
 
 /** Cheap display-only identity; never serialize an entire model/tool payload. */
 export function transcriptMessageKey(message: any): string {
@@ -392,6 +397,9 @@ export default function piDuo(pi: ExtensionAPI) {
   let activeTonyUserTurn: number | undefined;
   let completionReconcileTurn = -1;
   let completionNotifiedTurn = -1;
+  let austinRunning = false;
+  let tonyRunning = false;
+  let austinLastResponseEmpty = false;
   let extensionActive = true;
   let lifecycleGeneration = 0;
   let foregroundUI: ExtensionUIContext | undefined;
@@ -406,6 +414,7 @@ export default function piDuo(pi: ExtensionAPI) {
     | "finalized"
     | "failed"
     | "collaboration-failed"
+    | "paused"
     | "clear" = "clear";
   let reviewIndicatorDetail = "";
   let reviewIndicatorStartedAt = 0;
@@ -444,6 +453,12 @@ export default function piDuo(pi: ExtensionAPI) {
    * returned by `showOverlay` can, because it closes over its own entry.
    */
   let workbenchOverlayHide: (() => void) | undefined;
+  // `ui.custom()` resolves only after its overlay has actually left Pi's
+  // overlay stack. Keep that promise separate from the rendered panel: after
+  // `/duo stop`, `workbenchPanel` is deliberately cleared immediately, but a
+  // following `/duo start` must not create a second overlay until this one has
+  // settled. Two non-capturing overlays can otherwise cover the native dock.
+  let workbenchTask: Promise<void> | undefined;
   let workbenchRequestRender: ((force?: boolean) => void) | undefined;
   // Stream deltas can arrive much faster than a terminal can render. Keep the
   // first event responsive, then coalesce the rest into one trailing redraw.
@@ -454,25 +469,30 @@ export default function piDuo(pi: ExtensionAPI) {
   // per second remains visibly live without retaining multi-gigabyte bursts
   // on long sessions with large tool results.
   const WORKBENCH_REFRESH_MS = 200;
+  const WORKBENCH_SPACER_KEY = "pi-duo-workbench-spacer";
   const DEFAULT_PANEL_ROWS = 12;
   // Header + rule + notice + 3 metadata rows + rule + bottom rule.
   const MIN_PANEL_ROWS = 8;
+  // Keep Pi's native input dock visible even when extensions add widgets.
+  const MAX_WORKBENCH_HEIGHT_RATIO = 0.95;
   /**
    * Rows available to the panel: the terminal height minus the space pi needs
    * for the input dock (editor + status + widgets + footer). Falls back to the
    * default budget when terminal metrics are unavailable (e.g. in tests).
    *
-   * Why the reserve is derived and not a constant: pi composes the bottom of
-   * the screen as a `VStack` dock anchored at the bottom with `basis: "auto"`
-   * (`dist/modes/interactive/chat-viewport.js`), so the editor does **not** sit
-   * at a fixed offset from the terminal bottom - its top edge moves with the
-   * dock's natural height. A fixed reserve therefore cannot be right for more
-   * than one terminal size.
+   * The transcript recomputes this budget from the current terminal height on
+   * every render, so the reserved native dock remains visible after a resize.
    */
   const panelRowBudget = (tui: OverlayHost, reserve: number): number => {
     const rows = tui.terminal?.rows;
     if (!rows || !Number.isFinite(rows)) return DEFAULT_PANEL_ROWS;
-    return Math.max(MIN_PANEL_ROWS, Math.floor(rows - reserve));
+    return Math.max(
+      MIN_PANEL_ROWS,
+      Math.min(
+        Math.floor(rows - reserve),
+        Math.floor(rows * MAX_WORKBENCH_HEIGHT_RATIO),
+      ),
+    );
   };
 
   const transcriptMessages = (
@@ -527,23 +547,21 @@ export default function piDuo(pi: ExtensionAPI) {
 
   const workbenchFooter = (side: "austin" | "tony"): readonly string[] => {
     let status: string;
-    let active = false;
-    switch (reviewIndicatorPhase) {
+    const active = side === "austin" ? austinRunning : tonyRunning;
+    if (active) {
+      status = side === "austin" ? "Austin 正在工作" : "Tony 正在后台协作";
+    } else switch (reviewIndicatorPhase) {
       case "collaborating":
-        active = true;
-        status = side === "austin" ? "Austin 正在工作" : "Tony 正在后台协作";
+        status = side === "austin" ? "Austin 等待协作推进" : "Tony 等待协作推进";
         break;
       case "working":
-        active = side === "tony";
-        status = side === "austin" ? "Austin 等待 Tony" : "Tony 正在验证";
+        status = side === "austin" ? "Austin 等待 Tony" : "Tony 等待验证继续";
         break;
       case "waiting":
-        active = side === "austin";
-        status = side === "austin" ? "Austin 正在处理反馈" : "Tony 等待 Austin";
+        status = side === "austin" ? "Austin 等待继续" : "Tony 等待 Austin";
         break;
       case "complete":
-        active = side === "austin";
-        status = side === "austin" ? "Austin 正在最终收口" : "Tony 已验收";
+        status = side === "austin" ? "Austin 等待最终收口" : "Tony 已验收";
         break;
       case "finalized":
         status = side === "austin" ? "Austin 已完成" : "Tony 已完成";
@@ -552,8 +570,10 @@ export default function piDuo(pi: ExtensionAPI) {
         status = side === "austin" ? "Austin 等待处理异常" : "Tony 验证失败";
         break;
       case "collaboration-failed":
-        status = side === "austin" ? "Austin 单独工作" : "Tony 协作异常";
-        active = side === "austin";
+        status = side === "austin" ? "Austin 等待单独继续" : "Tony 协作异常";
+        break;
+      case "paused":
+        status = side === "austin" ? "Austin 收口暂停" : "Tony 等待恢复";
         break;
       default:
         status = side === "austin" ? "Austin 等待任务" : "Tony 等待任务";
@@ -586,11 +606,12 @@ export default function piDuo(pi: ExtensionAPI) {
    *  - footer: 3 rows (pwd row + stats row + optional status row;
    *    `components/footer.js` renders 2-3).
    *
-   * Other extensions' widgets/pending messages can still add rows we cannot
-   * see, so this remains a best-effort floor; the panel additionally
-   * self-truncates to the newest rows.
+   * `pi-lens` alone contributes several rows below the editor. The old two-row
+   * slack let the overlay paint blank transcript rows over Pi's editor and
+   * footer, making typed prompts appear to vanish. Keep a conservative six-row
+   * allowance for optional widgets and pending messages.
    */
-  const workbenchEditorReserve = (rows: number): number => {
+  const workbenchEditorReserve = (): number => {
     return EDITOR_ROWS + FOOTER_ROWS + DOCK_SLACK_ROWS;
   };
 
@@ -600,6 +621,11 @@ export default function piDuo(pi: ExtensionAPI) {
     if (reviewIndicatorPhase === "clear") {
       ui.setStatus("pi-duo-review", undefined);
       ui.setWidget("pi-duo-review", undefined, { placement: "belowEditor" });
+      workbenchPanel?.updateFooters(
+        workbenchFooter("austin"),
+        workbenchFooter("tony"),
+      );
+      workbenchRequestRender?.(force);
       return;
     }
     // The native Pi footer remains Austin-only. Duo metadata is rendered in
@@ -627,6 +653,7 @@ export default function piDuo(pi: ExtensionAPI) {
       | "finalized"
       | "failed"
       | "collaboration-failed"
+      | "paused"
       | "clear",
     detail?: string,
   ) => {
@@ -659,7 +686,7 @@ export default function piDuo(pi: ExtensionAPI) {
     // afterwards. Closing it without restoring would make `/duo history`
     // silently destroy the dual-column view the user was watching.
     const restoreWorkbench = workbenchPanel !== undefined;
-    closeWorkbench();
+    await closeWorkbench();
     const messages = await store.recentMessages(Number.MAX_SAFE_INTEGER);
     await foregroundUI.custom<void>((tui, _theme, _keybindings, done) => {
       let scrollOffset = 0;
@@ -806,10 +833,10 @@ export default function piDuo(pi: ExtensionAPI) {
    * bounded terms (the editor height is derived from the terminal size).
    */
   /** Pi's empty/single-line editor: top border + content + bottom border. */
-  const EDITOR_ROWS = 3;
+  const EDITOR_ROWS = 2;
   /** `components/footer.js` renders a pwd row + stats row + optional status. */
-  const FOOTER_ROWS = 3;
-  /** Room for transient status/pending rows added by other loaded extensions. */
+  const FOOTER_ROWS = 2;
+  /** Room for transient status/pending rows and built-in extension widgets. */
   const DOCK_SLACK_ROWS = 2;
 
   /**
@@ -858,22 +885,56 @@ export default function piDuo(pi: ExtensionAPI) {
     // frame and row budget survive (`/duo view` uses toggleWorkbench instead).
     if (workbenchPanel) return;
 
+    // `done()` removes the entry asynchronously. Await the previous custom()
+    // before opening another workbench so stop → start/reload never stacks two
+    // overlays over Pi's editor and footer.
+    const previousTask = workbenchTask;
+    if (previousTask) {
+      await previousTask.catch(() => undefined);
+      if (workbenchTask === previousTask) workbenchTask = undefined;
+      if (workbenchPanel) return;
+    }
+
     // The overlay's `done` callback and its entry-targeted `hide` are both
     // delivered asynchronously: `done` inside the factory, `onHandle` after the
     // factory resolves. Record them so `closeWorkbench` can tear down safely.
     let settled = false;
+    let overlayHost: OverlayHost | undefined;
+    const overlayRowBudget = () => overlayHost
+      ? panelRowBudget(overlayHost, workbenchEditorReserve())
+      : DEFAULT_PANEL_ROWS;
     try {
-      void ui
+      const task = ui
         .custom<void>(
           (tui, _theme, _keybindings, done) => {
             // Row budget comes from the real TUI, which is only reachable here.
             // `ctx.ui` exposes no terminal metrics in pi 0.86.
             const host = tui as OverlayHost;
-            const panel = new DuoTranscript(tui, ctx?.cwd ?? process.cwd(), () => panelRowBudget(
-              host,
-              workbenchEditorReserve(host.terminal?.rows ?? DEFAULT_PANEL_ROWS),
-            ));
+            overlayHost = host;
+            // Use the same dock-aware budget for the component and its
+            // overlay options. This callback also re-evaluates whenever Pi
+            // asks for options again rather than retaining a stale first frame.
+            const panel = new DuoTranscript(tui, ctx?.cwd ?? process.cwd(), overlayRowBudget);
             workbenchPanel = panel;
+            // Pi lays an empty document's dock at the top. Reserve exactly the
+            // rows painted by this top overlay so the native editor/footer is
+            // always pushed below it, including after a terminal resize.
+            ui.setWidget(
+              WORKBENCH_SPACER_KEY,
+              () => ({
+                render: (width: number) => Array.from(
+                  {
+                    length: Math.max(
+                      0,
+                      overlayRowBudget() - (workbenchPanel?.austinDocumentRows(width) ?? 0),
+                    ),
+                  },
+                  () => "",
+                ),
+                invalidate() {},
+              }),
+              { placement: "aboveEditor" },
+            );
             panel.setNotice(
               reviewIndicatorPhase === "finalized"
                 ? "✓ pi-duo 协作任务彻底完成"
@@ -903,27 +964,36 @@ export default function piDuo(pi: ExtensionAPI) {
               row: 0,
               col: 0,
               width: "100%",
-              // Pi resolves percentage bounds against the current terminal on
-              // every render. The transcript itself reserves the live dock.
-              maxHeight: "100%",
+              // Keep the overlay cap identical to its dock-aware render
+              // budget, including after a terminal-size recalculation.
+              maxHeight: overlayRowBudget(),
               nonCapturing: true,
             }),
             onHandle: (handle) => {
               workbenchOverlayHide = () => handle.hide();
             },
           },
-        )
-        .catch(() => {
-          // The host tears overlays down on shutdown, which can reject the
-          // pending promise. The workbench is an observability aid, never a
-          // hard dependency: degrade silently.
-          closeWorkbench();
-        });
+        );
+      workbenchTask = task;
+      void task.catch(() => {
+        // The host tears overlays down on shutdown, which can reject the
+        // pending promise. Do not call closeWorkbench(): a stale rejected
+        // promise must never tear down a newer overlay opened after reload.
+      }).finally(() => {
+        if (workbenchTask === task) {
+          foregroundUI?.setWidget(WORKBENCH_SPACER_KEY, undefined, { placement: "aboveEditor" });
+          workbenchTask = undefined;
+          workbenchClose = undefined;
+          workbenchOverlayHide = undefined;
+          workbenchPanel = undefined;
+          workbenchRequestRender = undefined;
+        }
+      });
     } catch {
       // This runs on the `session_start` / `/duo start` await chain. If the
       // terminal is already tearing down, `custom` can throw, and an uncaught
       // throw would abort the remaining startup work.
-      closeWorkbench();
+      await closeWorkbench();
       return;
     }
 
@@ -953,7 +1023,7 @@ export default function piDuo(pi: ExtensionAPI) {
   /** Toggles the workbench panel (`/duo view`). */
   const toggleWorkbench = async (ctx: ExtensionCommandContext) => {
     if (workbenchPanel) {
-      closeWorkbench();
+      await closeWorkbench();
       ctx.ui.notify("Duo 工作现场已隐藏（/duo view 重新打开）", "info");
       return;
     }
@@ -1010,7 +1080,7 @@ export default function piDuo(pi: ExtensionAPI) {
    * installed (the factory never ran), so that an overlay which did get pushed
    * cannot be leaked.
    */
-  const closeWorkbench = () => {
+  const closeWorkbench = (): Promise<void> => {
     if (workbenchRefreshTimer) clearTimeout(workbenchRefreshTimer);
     workbenchRefreshTimer = undefined;
     lastWorkbenchRefreshAt = 0;
@@ -1020,8 +1090,10 @@ export default function piDuo(pi: ExtensionAPI) {
     workbenchOverlayHide = undefined;
     workbenchPanel = undefined;
     workbenchRequestRender = undefined;
+    foregroundUI?.setWidget(WORKBENCH_SPACER_KEY, undefined, { placement: "aboveEditor" });
     if (close) close();
     else hideEntry?.();
+    return workbenchTask?.catch(() => undefined) ?? Promise.resolve();
   };
 
   const sendMessageSafely = (
@@ -1041,6 +1113,65 @@ export default function piDuo(pi: ExtensionAPI) {
         return false;
       throw error;
     }
+  };
+
+  const recoverAustinCloseout = async (
+    state: DuoState,
+    previousResponseEmpty: boolean,
+  ): Promise<"triggered" | "paused" | false> => {
+    if (
+      !store ||
+      state.status !== "active" ||
+      state.collaboration?.phase !== "execute" ||
+      state.review ||
+      state.finalizedUserTurn === state.collaboration.userTurn ||
+      tonyRunning
+    ) return false;
+
+    const attempts = state.collaboration.closeoutRecoveryAttempts ?? 0;
+    if (state.collaboration.closeoutRecoveryPaused || attempts >= 2) {
+      if (!state.collaboration.closeoutRecoveryPaused) {
+        await store.update((draft) => {
+          const collaboration = draft.collaboration;
+          if (!collaboration) return;
+          if (
+            collaboration.userTurn === state.collaboration?.userTurn &&
+            collaboration.phase === "execute"
+          ) collaboration.closeoutRecoveryPaused = true;
+        });
+        foregroundUI?.notify(
+          "pi-duo: Austin 两次自动收口仍未推进，协作已暂停，等待用户继续。",
+          "warning",
+        );
+      }
+      setReviewIndicator("paused");
+      return "paused";
+    }
+
+    await store.update((draft) => {
+      const collaboration = draft.collaboration;
+      if (!collaboration) return;
+      if (
+        collaboration.userTurn === state.collaboration?.userTurn &&
+        collaboration.phase === "execute" &&
+        !draft.review
+      ) {
+        collaboration.closeoutRecoveryAttempts = attempts + 1;
+        delete collaboration.closeoutRecoveryPaused;
+      }
+    });
+    setReviewIndicator("waiting");
+    sendMessageSafely(
+      {
+        customType: "pi-duo-closeout-recovery",
+        content:
+          `[Duo automatic closeout recovery ${attempts + 1}/2]${previousResponseEmpty ? " Your previous assistant response was empty." : " Your previous turn ended without advancing the Duo workflow."}\n` +
+          "The collaboration is still in EXECUTE with no verification pending. Reconcile the shared pi-duo todos now. If material work remains, continue it; otherwise call duo_checkpoint(action='ready_for_verification') and summarize the completed implementation. Do not stop after merely describing the next step.",
+        display: true,
+      },
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
+    return "triggered";
   };
 
   const getStore = (cwd: string) => {
@@ -2059,6 +2190,18 @@ export default function piDuo(pi: ExtensionAPI) {
       value && typeof value === "object"
         ? { ...value, isError }
         : { content: [{ type: "text", text: String(value ?? "") }], isError };
+    api.on("agent_start", () => {
+      if (actor === "austin") {
+        austinRunning = true;
+        austinLastResponseEmpty = false;
+      } else tonyRunning = true;
+      renderReviewIndicator();
+    });
+    api.on("agent_end", () => {
+      if (actor === "austin") austinRunning = false;
+      else tonyRunning = false;
+      renderReviewIndicator();
+    });
     api.on("message_start", (event) => {
       captureMessage(event.message);
       if (event.message?.role === "assistant") {
@@ -2069,6 +2212,11 @@ export default function piDuo(pi: ExtensionAPI) {
     });
     api.on("message_update", (event) => {
       if (event.message?.role !== "assistant") return;
+      const previous = actor === "austin" ? austinStreaming : tonyStreaming;
+      // Pi supplies a fresh assistant object for each stream update. Keep the
+      // capture cache pointed at that same object so message_end can replace
+      // it instead of appending a second copy of the completed response.
+      captureMessage(event.message, previous);
       if (actor === "austin") austinStreaming = event.message;
       else tonyStreaming = event.message;
       refreshWorkbench(false, actor);
@@ -2082,6 +2230,15 @@ export default function piDuo(pi: ExtensionAPI) {
       // every delta snapshot as a separate transcript row.
       captureMessage(event.message, streaming);
       if (event.message?.role === "assistant") {
+        if (actor === "austin") {
+          const content = Array.isArray(event.message.content)
+            ? event.message.content
+            : [];
+          austinLastResponseEmpty = !content.some((part: any) =>
+            part?.type === "toolCall" ||
+            (typeof part?.text === "string" && part.text.trim().length > 0)
+          );
+        }
         if (actor === "austin") austinStreaming = undefined;
         else tonyStreaming = undefined;
       }
@@ -2152,9 +2309,15 @@ export default function piDuo(pi: ExtensionAPI) {
         };
       });
     };
+    // The loader and session must share one settings snapshot. Otherwise the
+    // embedded Tony runtime can silently fall back to Pi's defaults (notably
+    // the 300s provider timeout) while the foreground runtime uses a changed
+    // global/project setting.
+    const settingsManager = SettingsManager.create(cwd, getAgentDir());
     const loader = new DefaultResourceLoader({
       cwd,
       agentDir: getAgentDir(),
+      settingsManager,
       noExtensions: true,
       additionalExtensionPaths: resolveTonyExtensionPaths(
         getAgentDir(),
@@ -2175,6 +2338,7 @@ export default function piDuo(pi: ExtensionAPI) {
       model,
       resourceLoader: loader,
       sessionManager: manager,
+      settingsManager,
     });
     const activeTony = created.session;
     if (!isCurrentGeneration(generation)) {
@@ -2206,6 +2370,7 @@ export default function piDuo(pi: ExtensionAPI) {
     tonyUnsubscribe = undefined;
     const activeTony = tony;
     tony = undefined;
+    tonyRunning = false;
     tonyStreaming = undefined;
     tonyCapturedMessages.length = 0;
     tonyTools.clear();
@@ -2596,11 +2761,17 @@ export default function piDuo(pi: ExtensionAPI) {
     // Duo mode shows the dual-column workbench by default. Restoring an active
     // Austin session must bring it back, so the user can immediately type the
     // next task into the editor while watching both columns.
-    if (isAustinSession) {
+    if (isAustinSession && state) {
       // Automatic: resuming an active duo in a non-TUI host must not emit an
       // unsolicited "requires TUI mode" error.
       await openWorkbench(ctx, { silent: true });
-      if (needsFinalization) {
+      const recovery = await recoverAustinCloseout(state, false);
+      if (recovery === "triggered") {
+        ctx.ui.notify(
+          "pi-duo: 检测到中断在 EXECUTE，正在自动恢复 Austin 收口。",
+          "info",
+        );
+      } else if (!recovery && needsFinalization) {
         ctx.ui.notify(
           "pi-duo: Tony 已验收，正在恢复 Austin 被中断的最终收口。",
           "info",
@@ -2616,7 +2787,7 @@ export default function piDuo(pi: ExtensionAPI) {
         );
       }
     } else {
-      closeWorkbench();
+      await closeWorkbench();
     }
   });
 
@@ -2661,6 +2832,7 @@ export default function piDuo(pi: ExtensionAPI) {
       state.review?.status === "pending"
     )
       return;
+    if (await recoverAustinCloseout(state, austinLastResponseEmpty)) return;
     const ids = openCompletionTodoIds(state);
     if (!ids.length) {
       const completionTurn =
@@ -2770,8 +2942,10 @@ export default function piDuo(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    austinRunning = false;
+    tonyRunning = false;
     setReviewIndicator("clear");
-    closeWorkbench();
+    await closeWorkbench();
     foregroundUI = undefined;
     foregroundDuoActive = false;
     extensionActive = false;
@@ -2945,7 +3119,7 @@ export default function piDuo(pi: ExtensionAPI) {
         });
         foregroundDuoActive = false;
         setReviewIndicator("clear");
-        closeWorkbench();
+        await closeWorkbench();
         if (!ctx.isIdle()) ctx.abort();
         ctx.ui.notify(
           "Duo stopped immediately; active Austin/Tony turns are being aborted and both session histories were preserved",

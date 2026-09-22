@@ -67,6 +67,7 @@ flowchart LR
 - **循环保护**：总消息预算、连续 peer-only 限制、相似消息抑制、关键消息 deferred 槽。
 - **可靠恢复**：`/duo stop` 保留历史，`/duo resume` 恢复两个 session。
 - **中断续接**：若进程停在“Tony 已验收、Austin 尚未最终回复”，reload/resume 会自动恢复最后收口；已 finalized 的任务不会重复执行。
+- **有界收口恢复**：Austin 在 `EXECUTE` 中提前结束或返回空响应时自动续接，最多两次；仍未推进则明确暂停，不会无限消耗 token。
 - **并发安全**：revision、原子 rename、跨进程锁和 stale-lock recovery。
 
 ## 环境要求
@@ -326,7 +327,7 @@ Pi 默认的 `ESC` 是“取消或中止”键。Austin 正在前台生成时，
 
 这里没有选择列表是有意的：Duo 状态已经保存了两个 session 的 ID 和文件路径，用户无需再次配对。如果想恢复另一段普通 Pi session，请使用 Pi 原生 `/resume`；如果想把它建立成一组新的 Duo，请在那个 session 中执行 `/duo start`。
 
-正常的 `/duo resume` **不会自动开始新任务，也不会在没有用户提示词时让双方继续闲置工作**。`autoDispatch=true` 只在用户提交一条非命令文本时，才把该任务同时调度给 Tony。例外只有未完成的旧控制流程：恢复时若发现被打断的 `pending` Tony review，或 Tony 已验收但 Austin 尚未完成最终回复，pi-duo 会自动唤醒 Austin 收口；不会创建新任务。
+正常的 `/duo resume` **不会自动开始新任务，也不会在没有用户提示词时让双方继续闲置工作**。`autoDispatch=true` 只在用户提交一条非命令文本时，才把该任务同时调度给 Tony。例外是未完成的旧控制流程：恢复时若状态仍在 `EXECUTE`、存在被打断的 `pending` Tony review，或 Tony 已验收但 Austin 尚未完成最终回复，pi-duo 会自动唤醒 Austin 继续原任务；不会创建新任务。
 
 如果状态已经持久化为 finalized，`/reload` 和 `/duo resume` 只恢复双栏及完成横幅，不会再次唤醒 Austin。若看到双方“已完成”但尚无完成横幅，则表示最终完成记录尚未落盘，pi-duo 会继续一次收口回合。
 
@@ -654,6 +655,8 @@ Austin 的原生 session 仍保存在 Pi 的正常 session 目录中；`state.js
 ### todo 已完成但状态仍 pending
 
 pi-duo 会把带有 `pending`/`in_progress` 共享 todo 的终稿标为尚未完成，并自动追加一次收口回合。Austin 应调用 `duo_todo update`：已完成项标为 `done`，确实未完成的项保留为 `pending` 或 `blocked` 并向用户说明。
+
+若 Austin 在 `EXECUTE` 阶段结束生成却没有发起复验，pi-duo 会自动追加收口提示；空 assistant 响应也按同样方式处理。每个用户回合最多自动恢复两次，之后双栏会显示“收口暂停”，等待用户决定是否继续。双栏旋转状态只来自真实的 `agent_start/agent_end`，因此工作流仍处于 `EXECUTE` 时也不会错误显示双方一直在运行。
 
 ### Austin 显示 preliminary / Tony review pending
 
